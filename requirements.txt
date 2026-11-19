@@ -1,0 +1,32 @@
+# BAMER-RL 环境依赖（Python 3.11）
+# 本地 conda 环境名: BAMER ；正式训练在私人服务器，本文件为服务器复现依据
+#
+# PyTorch CUDA 版需从官方源安装（PyPI 默认只有 CPU 版）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# 服务器若为 Linux，同样使用上述命令（按服务器 CUDA 驱动选择 cu126/cu128 等）
+
+# --- 深度学习 ---
+torch==2.14.1+cu126        ; 安装命令见上方注释
+torchvision==0.29.1+cu126  ; 安装命令见上方注释
+stable-baselines3==2.9.2
+
+# --- 强化学习环境接口 ---
+gymnasium==1.4.0
+
+# --- 数值计算与可视化 ---
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.1.1
+matplotlib==3.11.2
+pillow==13.0.0
+
+# --- 图像处理 ---
+opencv-python==5.1.0.95
+
+# --- 机器学习工具（基线模型/评估） ---
+scikit-learn==1.9.1
+
+# --- 工具链 ---
+tqdm==4.70.1
+pyyaml==6.0.3
+ipykernel==7.4.0

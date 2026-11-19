@@ -1,0 +1,7 @@
+# Python 运行产物
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 训练产物（checkpoint/日志不入库，路径由配置指定）
+algo/runs/

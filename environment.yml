@@ -1,0 +1,10 @@
+# BAMER-RL conda 环境定义
+# 用法: conda env create -f environment.yml && conda activate BAMER
+name: BAMER
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt
