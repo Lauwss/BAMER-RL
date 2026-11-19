@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Env 单测（M1.2 验收）：reset 种子可复现、终止/截断语义正确、计步含旋转、信息封闭。"""
+"""Env 单测（M1.2 验收 + 2026-11-20 携带语义）：reset 种子可复现、终止/截断语义正确、计步含旋转、信息封闭、拾取/派送事件流。"""
 import os
 import random
 import sys
@@ -13,7 +13,9 @@ from bamer_env.env import HEADINGS
 from bamer_env.interaction import (
     EVENT_ARRIVED,
     EVENT_COLLISION,
+    EVENT_DESTINATION_FEED,
     EVENT_IMAGE_FEED,
+    EVENT_PICKUP,
     EVENT_REPORTED,
     EVENT_TASK_COMPLETE,
     EVENT_TIMEOUT,
@@ -35,6 +37,13 @@ def task_env(**kwargs):
     )
     params.update(kwargs)
     return BamerEnv(**params)
+
+
+# 携带语义下的完整任务动作序列（15 步）：
+#   F F → (0,2) 识别+拾取屈原@2；TR F F → (2,2) 识别昭君@5（手持，不拾取）；
+#   F F → (4,2) 派送屈原→楚国@7；TB F F → (2,2) 拾取昭君@10；
+#   TB F F → (4,2) 重过楚国@13（仅 DestinationFeed）；TL F → (4,3) 派送昭君→西汉@15
+FULL_TASK_ACTIONS = ["F", "F", "TR", "F", "F", "F", "F", "TB", "F", "F", "TB", "F", "F", "TL", "F"]
 
 
 def _by_step(info):
@@ -92,49 +101,58 @@ def test_collision_keeps_position():
 
 
 def test_full_task_flow():
-    """完整任务流：识别→派送→TaskComplete，事件序列与步数逐点核对。"""
+    """完整任务流（携带语义）：首达拾取→识别→派送→回取→派送→TaskComplete，事件序列与步数逐点核对。"""
     env = task_env()
     obs, info = env.reset(seed=0)
-    actions = ["F", "F", "TR", "F", "F", "F", "F", "TL", "F"]
-    # 步 2 进入 (0,2) 识别屈原；步 5 进入 (2,2) 识别昭君；
-    # 步 7 进入 (4,2) 派送屈原→楚国；步 9 进入 (4,3) 派送昭君→西汉 → TaskComplete
-    events_log, flags = [info["events"]], []
-    for a in actions:
+    events_log, flags, carrying_log = [info["events"]], [], []
+    for a in FULL_TASK_ACTIONS:
         obs, reward, terminated, truncated, info = env.step(a)
         events_log.append(info["events"])
         flags.append((terminated, truncated))
-    feeds = [(e.step, e.payload["machine"]) for evs in events_log
+        carrying_log.append(env.carrying)
+    feeds = [(e.step, e.payload["machine"], e.payload["first"]) for evs in events_log
              for e in _of_type(evs, EVENT_IMAGE_FEED)]
+    pickups = [(e.step, e.payload["machine"]) for evs in events_log
+               for e in _of_type(evs, EVENT_PICKUP)]
+    destfeeds = [(e.step, e.payload["destination"], e.payload["first"]) for evs in events_log
+                 for e in _of_type(evs, EVENT_DESTINATION_FEED)]
     arrived = [(e.step, e.payload["machine"], e.payload["destination"])
                for evs in events_log for e in _of_type(evs, EVENT_ARRIVED)]
     completes = [e.step for evs in events_log for e in _of_type(evs, EVENT_TASK_COMPLETE)]
-    assert feeds == [(2, "quyuan"), (5, "zhaojun")]
-    assert arrived == [(7, "quyuan", "chuguo"), (9, "zhaojun", "xihan")]
-    assert completes == [9]
-    assert flags[-1] == (True, False) and all(not t for t, _ in flags[:-1])
-    assert info["steps"] == 9 and env.pose_cell == (4, 3)
+    assert feeds == [(2, "quyuan", True), (5, "zhaojun", True), (10, "zhaojun", False)]
+    assert pickups == [(2, "quyuan"), (10, "zhaojun")]
+    assert destfeeds == [(7, "chuguo", True), (13, "chuguo", False), (15, "xihan", True)]
+    assert arrived == [(7, "quyuan", "chuguo"), (15, "zhaojun", "xihan")]
+    assert completes == [15]
+    assert flags[-1] == (True, False)
+    assert all(not t and not tr for t, tr in flags[:-1])
+    assert info["steps"] == 15 and env.pose_cell == (4, 3)
+    assert carrying_log[1] == "quyuan" and carrying_log[6] is None \
+        and carrying_log[9] == "zhaojun" and carrying_log[13] == "zhaojun" \
+        and env.carrying is None
     assert obs["identified"].tolist() == [1, 1] and obs["delivered"].tolist() == [1, 1]
     # 任务达成后环境仍可交互，terminated 保持完成态
     obs, _, terminated, truncated, info = env.step("F")
     assert terminated is True and truncated is False
-    print("[完整任务流] OK：识别@2/5 派送@7/9 TaskComplete@9（共 9 步）")
+    print("[完整任务流] OK：拾取@2/10 派送@7/15 TaskComplete@15（携带语义 15 步）")
 
 
-def test_delivery_requires_identification():
-    """识别前经过终点格不派送；单侧派送不终止。"""
+def test_delivery_requires_carrying():
+    """派送前置（携带语义）：未携带时到终点仅 DestinationFeed，不派送、不终止。"""
     env = task_env()
     env.reset(seed=0)
-    for a in ["TR", "F", "F", "F", "F", "TL", "F", "F"]:    # 东行至 (4,0) 再北上 (4,2)
+    events_log = []
+    # 东行至 (4,0) 再北上 (4,2)→(4,3)：途经两个终点格，全程空手
+    for a in ["TR", "F", "F", "F", "F", "TL", "F", "F", "F"]:
         obs, _, terminated, truncated, info = env.step(a)
-    assert not _of_type(info["events"], EVENT_ARRIVED)      # 未识别任何状态机 → 不派送
-    for a in ["TL", "F", "F", "TB", "F", "F", "TL", "F"]:   # 去识别昭君(2,2) 再折返 (4,3)
-        obs, _, terminated, truncated, info = env.step(a)
-    assert ("zhaojun", "xihan") in [(e.payload["machine"], e.payload["destination"])
-                                    for e in _of_type(info["events"], EVENT_ARRIVED)]
-    assert info["delivered"] == ["zhaojun"]                  # 单侧派送
-    assert not _of_type(info["events"], EVENT_TASK_COMPLETE)
-    assert terminated is False
-    print("[派送前置] OK：识别前不派送 / 单侧派送不终止")
+        events_log.append(info["events"])
+    all_events = [e for evs in events_log for e in evs]
+    assert not _of_type(all_events, EVENT_ARRIVED)          # 未携带 → 不派送
+    destfeeds = [(e.step, e.payload["destination"], e.payload["first"])
+                 for e in _of_type(all_events, EVENT_DESTINATION_FEED)]
+    assert destfeeds == [(8, "chuguo", True), (9, "xihan", True)]
+    assert info["delivered"] == [] and terminated is False
+    print("[派送前置] OK：未携带仅发现终点 / 不派送 / 不终止")
 
 
 def test_timeout_truncation():
@@ -154,14 +172,42 @@ def test_timeout_truncation():
 
 def test_terminated_wins_at_max_steps():
     """恰好在第 max_steps 步完成任务：terminated 优先，不发 Timeout。"""
-    env = task_env(max_steps=9)
+    env = task_env(max_steps=len(FULL_TASK_ACTIONS))
     env.reset(seed=0)
-    for a in ["F", "F", "TR", "F", "F", "F", "F", "TL", "F"]:
+    info = None
+    for a in FULL_TASK_ACTIONS:
         obs, _, terminated, truncated, info = env.step(a)
     assert terminated is True and truncated is False
+    assert info["steps"] == len(FULL_TASK_ACTIONS)
     assert _of_type(info["events"], EVENT_TIMEOUT) == []
     assert _of_type(info["events"], EVENT_TASK_COMPLETE)
     print("[终止优先] OK：同步到达时 terminated 优先于 truncated")
+
+
+def test_curriculum_search():
+    """课程臂 A 阶段 0（curriculum="search"）：4 个 POI 定位即 terminated，与派送解耦。"""
+    env = task_env(curriculum="search")
+    obs, info = env.reset(seed=0)
+    events_log = [info["events"]]
+    info, terminated, truncated = None, False, False
+    for k, a in enumerate(["F", "F", "TR", "F", "F", "F", "F", "TL", "F"], start=1):
+        obs, _, terminated, truncated, info = env.step(a)
+        events_log.append(info["events"])
+        if k < 9:
+            assert not terminated, f"步 {k} 不应提前终止"
+    # 步 9 进入 (4,3)：机器双识别@2/5 + 终点双发现@7/9 → terminated
+    assert terminated is True and truncated is False
+    assert info["steps"] == 9
+    # 交互机制不变：途中屈原已自动派送（Arrived@7），但 TaskComplete 不发（昭君未派送）
+    all_events = [e for evs in events_log for e in evs]
+    arrived = [(e.step, e.payload["machine"]) for e in _of_type(all_events, EVENT_ARRIVED)]
+    assert arrived == [(7, "quyuan")]
+    assert _of_type(all_events, EVENT_TASK_COMPLETE) == []
+    feeds = [(e.step, e.payload["machine"]) for e in _of_type(all_events, EVENT_IMAGE_FEED)]
+    destfeeds = [(e.step, e.payload["destination"]) for e in _of_type(all_events, EVENT_DESTINATION_FEED)]
+    assert feeds == [(2, "quyuan"), (5, "zhaojun")]
+    assert destfeeds == [(7, "chuguo"), (9, "xihan")]
+    print("[搜索课程] OK：curriculum=search 下 4 POI 定位即 terminated（交互机制不变）")
 
 
 def _random_trajectory(seed: int):
@@ -215,7 +261,7 @@ def test_reset_options_injection():
         "destinations": {"chuguo": (4, 2), "xihan": (4, 3)},
     })
     assert env.scene.state_machines == {"quyuan": (0, 2), "zhaojun": (2, 2)}
-    for a in ["F", "F", "TR", "F", "F", "F", "F", "TL", "F"]:
+    for a in FULL_TASK_ACTIONS:
         obs, _, terminated, truncated, info = env.step(a)
     assert terminated is True
     print("[注入接口] OK：reset(options=...) 注入新场景并完成任务")
@@ -288,7 +334,8 @@ if __name__ == "__main__":
     test_rotation_step_counting()
     test_collision_keeps_position()
     test_full_task_flow()
-    test_delivery_requires_identification()
+    test_delivery_requires_carrying()
+    test_curriculum_search()
     test_timeout_truncation()
     test_terminated_wins_at_max_steps()
     test_seed_reproducibility()

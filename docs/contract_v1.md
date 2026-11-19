@@ -1,9 +1,10 @@
 # BAMER 契约 v1.0（定稿候选 · v1.0-rc）
 
-> 状态：**定稿候选**——物理/几何语义与观测/动作/奖励三章已按用户确认（2026-11-20）填写，
-> 依据 = [rl_algorithm_design.md](rl_algorithm_design.md)（D6/D7/D8/D10 定稿）。
-> 整体冻结（升级 v1.0）随 M2.6 门禁进行：新事件实现 + 单测同步后由用户最终确认；
-> 冻结后任何变更：先经用户确认 → 记入 [CHANGELOG.md](CHANGELOG.md) → 单测同步更新。
+> 状态：**定稿候选（可冻结）**——物理/几何语义与观测/动作/奖励三章已按用户确认
+> （2026-11-20）填写，依据 = [rl_algorithm_design.md](rl_algorithm_design.md)（D6/D7/D8/D10 定稿）；
+> **§3 两个新事件（Pickup/DestinationFeed）已实现 + 单测同步（2026-11-20）**。
+> 整体冻结（升级 v1.0）待用户最终确认；冻结后任何变更：先经用户确认 →
+> 记入 [CHANGELOG.md](CHANGELOG.md) → 单测同步更新 → 版本号 v1.x 递增。
 
 | 章节 | 状态 | 依据 |
 | --- | --- | --- |
@@ -50,17 +51,18 @@
 | --- | --- | --- |
 | `Reported` | 每步实时上报自身格坐标（题目规则） | x, y |
 | `ImageFeed` | 进入状态机所在格（停留不重复，离开再进重新下发） | machine, label, image, first |
-| `Pickup` | **【新增 2026-11-20，待实现】** Pick option 到达已识别状态机所在格 → carrying 生效 | machine, x, y |
-| `DestinationFeed` | **【新增 2026-11-20，待实现】** 进入终点所在格（发现终点；终点位置封闭，须自主发现） | destination, image, first |
+| `Pickup` | **【已实现 2026-11-20】** 进入状态机所在格且空手且未送达 → carrying 生效（首达即识别+拾取同步；识别时手持他机仅识别、事后 Pick 回取；已送达不重复拾取；单机负载） | machine, x, y |
+| `DestinationFeed` | **【已实现 2026-11-20】** 进入终点所在格（发现终点；终点位置封闭，须自主发现；first 标记首次，与 Arrived 可同入并存） | destination, image, first |
 | `Arrived` | **已携带**状态机映射的终点格到达（派送自动完成；未携带时进终点格仅触发 `DestinationFeed`） | machine, destination, x, y |
 | `Collision` | F 指向有墙边界 | x, y, direction |
 | `TaskComplete` | 全部派送达成（仅转变时一次） | steps |
 | `Timeout` | 达到 max_steps（truncated） | max_steps |
 
-**两项语义已确认（2026-11-20 用户拍板，见 rl_algorithm_design.md §8）**：
+**两项语义已确认（2026-11-20 用户拍板）+ 一项实现期推导语义（随冻结确认）**：
 
 1. **派送触发**：进入"**已携带**且已识别"状态机映射的终点格 → 自动完成派送（`Arrived`）；未携带时进终点格 = 仅发现该终点（`DestinationFeed`）。终点位置固定 (8,8)/(7,7) 但对机器鼠封闭，须自主发现。
 2. **ImageFeed 载荷可见性（R1）**：算法侧合法字段仅 `image`（像素）+ 事件步号；`machine`/`label` 仅供环境侧评估与展示（`CameraUnit` 已按此实现：识别流水线只消费像素，GT 仅评估口径参与）。poi 通道"已识别"标记的数据来源 = 分类器输出，非事件字段。
+3. **Pickup 首达语义（实现期推导，见 CHANGELOG 2026-11-20）**：执行器只产出 D5 原语（§5），env 层不感知 option 意图 → 拾取触发 = "进入状态机格且空手且未送达"；首达即 ImageFeed+Pickup 同步（否则一切首次拾取需二次到访，与 R3 步数最优矛盾）；"识别时手持他机 → 事后 Pick 回取"保持 Pick 选项真实语义。
 
 ## 4. 观测空间——D7 定稿参数（2026-11-20 填写，依据 rl_algorithm_design.md §2）
 

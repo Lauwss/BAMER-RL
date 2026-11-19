@@ -2,6 +2,85 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-20 — 阶段三开工：契约新事件实现 + algo/ 全模块构建（§8 冒烟 1–5 通过）
+
+### 新增
+
+- **`bamer_env/interaction.py` 契约事件实现（contract §3 定稿语义落地）**：
+  - `Pickup`：进入状态机所在格且空手且未送达 → carrying 生效（首达即识别+拾取
+    同步发生；识别时手持他机仅识别、事后 Pick 回取——259 选项中 2 个 Pick 的
+    真实语义；已送达机器不重复拾取；单机负载）；
+  - `DestinationFeed`：进入终点所在格下发终点图像（first 标记首次发现；终点
+    封闭须自主发现——算法侧唯一终点发现通道）；
+  - 派送前置从"已识别"改为"**已携带**"（2026-11-20 拍板）：进入已携带且映射的
+    终点格 → Arrived 自动派送；`search_complete` 属性（课程臂 A 阶段 0 判据）；
+  - 终点图像资产 `DESTINATION_ASSETS`（与 render.py 同源 image3/5）。
+- **`bamer_env/env.py`**：构造参数 `curriculum="search"`（臂 A 阶段 0：terminated
+  = 4 POI 定位，交互机制不变）；只读属性 `env.carrying`。
+- **`algo/` 包（阶段三全模块，docs/rl_algorithm_design.md §8 定稿）**：
+  - `belief.py`：探测账本（规范形式感知记录，walk_cells 量测复算、只增不减、
+    有墙优先）+ 轨迹账本 + 16 通道信念张量派生（[C,x,y] 布局与 bench 一致；
+    墙值不存储、每次全量重派生）；GTAssetClassifier 直通占位（只消费合法
+    image 字段）；R1 自洽（不 import scene/Maze）；
+  - `actions.py`：259 选项枚举（Explore 256 + Pick 2 + Deliver 1）+ 动态合法掩码
+    （信念图可达集；Explore 排除当前格防 τ=0 死循环；已送达机器不可 Pick）；
+  - `executor.py`：(格,朝向) 1024 态 BFS（转向计步 R4）+ 每步重规划 + 不可达
+    中止；OptionResult 全量记录（SMDP 转移材料）；
+  - `network.py`：FCQN 三分支（3 层卷积主干 32/64/64 + Explore score map +
+    Pick/Deliver/Value 池化头）+ 辅助补墙头 (4,16,16) logits；dueling_q 动态
+    掩码组合（均值只取合法动作）；use_gru 显式 NotImplementedError 预留；
+  - `replay.py`：option 级 uint8 环形经验池（含双端合法掩码 + 辅助 GT 墙线）；
+  - `agent.py`：ε-greedy + Double-DQN 学习步（γ^τ SMDP 折扣；terminated 不
+    自举、truncated 自举）+ 辅助 BCE（unknown 槽位）+ 梯度裁剪 + checkpoint；
+  - `trainer.py`：训练循环 / 种子管理（master seed → 环境+agent 独立流）/
+    checkpoint 恢复 / CSV 日志 / 三臂课程（A 搜索预训练 / B 熵预训练 / C 基线，
+    阶段切换 = buffer 清空 + target 重置 + ε 重启 0.05）；D8 奖励实现于奖励
+    包装层（−1/步 + 首次识别/终点发现 +100 + 送达 +300；臂 A 阶段 0 去送达、
+    臂 B 阶段 0 = 信息增益精确计数）；
+  - `eval.py`：固定 seed 套件评估（贪心）+ **全知 BFS 参照**（(格,朝向,任务
+    进度) 状态空间 BFS，两条合法任务序取最小）+ 指标（成功率/搜寻/派送/总步数/
+    探索区域率/墙知识率/参照差距）；
+  - `configs/`：smoke.yaml（本地冒烟）+ armA/armB/armC.yaml（服务器正式配置）。
+- **`tools/train.py`**：训练/评估统一入口（--config/--resume/--eval/--eval-seeds），
+  正式训练交私人服务器执行（BAMER 环境）。
+- **tests/ 新增 5 个（§8 冒烟顺序）**：`test_belief.py`（账本手算对拍 + R1 自检
+  GT-free 输入流）/ `test_executor.py`（解析解对拍含转向计步、重规划/中止、
+  Pick/Deliver 全流程）/ `test_network.py`（掩码语义、手工场景 argmax 合规、
+  200 组随机掩码模糊）/ `test_agent_replay.py`（uint8 往返、ε-greedy 100% 合法、
+  warmup 边界、γ^τ 对拍、阶段切换、GT 派生）/ `test_trainer_smoke.py`（端到端
+  分钟级冒烟、**同种子复现逐行一致**、评估套件 + 全知参照 50 步）。
+
+### 修复（实现期测试抓出的真 bug）
+
+- `actions.legal_mask`：已送达机器仍可 Pick（补 machine_delivered 排除）；
+- `executor.run`：到达目标格的 break 早于 terminated 标志记录 → "送达即终止"
+  的 terminated 丢失（先行记录后 break）；
+- `eval.run_eval_episode`：一次不可达中止即终止整条评估 episode → 改为连续
+  中止 8 次判死锁（失败信号应交还高层）。
+
+### 语义登记（随本次实现一并落地，请用户随 M2.6 冻结确认）
+
+1. **Pickup 首达语义**：env 层"进入状态机格且空手且未送达"即拾取（首达 =
+   ImageFeed+Pickup 同步）。推导依据：执行器只产出 D5 原语（§3.2）env 无法
+   感知 option 意图；若首达不拾取则一切首次拾取需二次到访，与 R3 步数最优
+   矛盾；"识别时手持他机 → Pick 回取"恰好保持 Pick 选项的真实语义。
+2. **DestinationFeed 正交性**：进入终点格恒触发（first 标记首次），与 Arrived
+   同一进入可并存；未携带（或携带非映射机器）不派送。
+3. **评估循环死锁判据**：连续 8 次不可达中止 = episode 提前失败（工程保险丝）。
+
+### 契约状态
+
+- contract_v1.md §3 两个新事件 **已实现 + 单测同步** → v1.0-rc 达到可冻结状态，
+  **整体冻结待用户最终确认**（冻结后版本号升 v1.0）。
+
+### 冒烟验收（§8 顺序，全部通过）
+
+1. belief：账本手算对拍 / 张量通道 / R1 自检 ✅
+2. executor：BFS 解析解（含 TB 计 1 步）/ 重规划中止 / Pick-Deliver 全流程 ✅
+3. network：dueling 掩码语义 / 手工场景 argmax 合规 / 随机掩码模糊 ✅
+4. agent+replay：学习无 NaN / 合法动作 100% / γ^τ / 阶段切换 ✅
+5. trainer+eval：端到端 1.7s 冒烟 / **同种子复现逐行一致** / 全知参照 50 步 ✅
+
 ## 2026-11-20 — 阶段三算法设计定稿（D6/D7 参数/D8/D10）+ 契约三章填写
 
 ### 新增

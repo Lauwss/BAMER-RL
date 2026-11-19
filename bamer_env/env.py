@@ -20,12 +20,21 @@
   决策级动作空间（D6）待用户拍板后再包装。
 - 观测空间：格子级离散 Dict —— cell（格序号 y*n+x）、heading（0=N 1=E 2=S 3=W）、
   identified/delivered（MultiBinary，按状态机名字典序）。这是机器鼠自身状态与
-  交互反馈，不含迷宫结构/状态机位置（R1 信息封闭）；激光点云接通后（M2.2/M2.3）
-  观测将重构为 D7 已选定的局部占据栅格表示（2026-11-19 用户拍板）。
-- 奖励：reward = step_reward（默认 -1.0/步，纯时间惩罚占位）——奖励函数 D8
-  归用户设计，本数值仅为阶段一自测服务。
+  交互反馈，不含迷宫结构/状态机位置（R1 信息封闭）；D7 定稿后观测表示 =
+  16 通道全图信念张量，由算法侧账本派生（docs/rl_algorithm_design.md §2），
+  obs 维持占位 Dict，量测与事件经 info 透传（contract_v1.md §4"算法侧组袋"）。
+- 奖励：reward = step_reward（默认 -1.0/步，纯时间惩罚占位）——正式奖励 D8
+  在算法侧包装层实现（-1/步 + 里程碑，事件来源 info["events"]），本数值仅为
+  阶段一自测服务。
 - 终止语义：terminated = 两项派送均达成（TaskComplete）；
   truncated = 达到 max_steps（Timeout）。碰撞只产生事件与 step 计数，不终止。
+  构造参数 curriculum="search"（课程臂 A 阶段 0 专用）改为 terminated =
+  全部 POI（2 机器识别 + 2 终点发现）定位，机器交互机制（拾取/派送）不变。
+- 携带语义（2026-11-20 契约定稿，contract_v1.md §3）：进入状态机所在格且空手
+  且未送达 → Pickup 事件 + carrying 生效（首达即识别+拾取；识别时手持他机仅
+  识别，事后经 Pick option 回取）；进入"已携带且映射"的终点格 → 自动派送
+  （Arrived）。carrying 经 `env.carrying`（展示/评估侧）与 Pickup/Arrived 事件
+  （算法侧合法通道）可见。
 
 **传感器套件（M2.2/M2.3 接通，可选，默认关闭）**：
 - 构造参数 `lidar=LidarSpec(...)`（默认 None = 不接雷达，行为与阶段一验收版
@@ -87,6 +96,7 @@ class BamerEnv(gymnasium.Env):
         randomize: bool = False,
         max_steps: int = 1000,
         step_reward: float = -1.0,
+        curriculum: Optional[str] = None,
         render_mode: Optional[str] = None,
         lidar: Optional[LidarSpec] = None,
         lidar_seed: Optional[int] = None,
@@ -94,6 +104,9 @@ class BamerEnv(gymnasium.Env):
         super().__init__()
         if render_mode not in (None, "rgb_array"):
             raise ValueError(f"render_mode 仅支持 None/'rgb_array'，得到 {render_mode!r}")
+        if curriculum not in (None, "search"):
+            raise ValueError(f"curriculum 仅支持 None/'search'，得到 {curriculum!r}")
+        self.curriculum = curriculum
         self._maze_fixed = maze
         self._machines_fixed = dict(state_machines) if state_machines else None
         self._destinations_fixed = dict(destinations) if destinations else None
@@ -209,7 +222,12 @@ class BamerEnv(gymnasium.Env):
         if self._cell != self._visited[-1]:
             self._visited.append(self._cell)
 
-        terminated = self._interaction.task_complete
+        if self.curriculum == "search":
+            # 课程臂 A 阶段 0：全部 POI（机器识别 + 终点发现）定位即 terminated；
+            # 交互机制（拾取/派送事件）不变，送达奖励由算法侧奖励包装层关闭。
+            terminated = self._interaction.search_complete
+        else:
+            terminated = self._interaction.task_complete
         truncated = (not terminated) and self._steps >= self.max_steps
         if truncated:
             events.append(self._interaction.timeout_event(self._steps, self.max_steps))
@@ -252,6 +270,11 @@ class BamerEnv(gymnasium.Env):
     @property
     def visited_cells(self) -> List[Cell]:
         return list(self._visited)
+
+    @property
+    def carrying(self) -> Optional[str]:
+        """正在携带的状态机名（None = 空手）。展示/评估侧用；算法侧走 Pickup/Arrived 事件。"""
+        return self._interaction.carrying if self._interaction is not None else None
 
     # ---------- 内部 ----------
     def _resolve_action(self, action) -> str:

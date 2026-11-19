@@ -151,9 +151,9 @@
 - `Classifier` 协议（接口）：真实识别模型（深度学习分类）作为可插拔实现，另提供 GT 直通占位；
 - **归属待确认（D9）**：图像数据集构建与分类模型训练是否在本项目范围内、由谁主导——需用户拍板，暂只做接口与占位。
 
-### M2.6 契约冻结（阶段二收尾门禁）— `docs/contract_v1.md` 🔶 三章已填写（2026-11-20），待整体冻结
+### M2.6 契约冻结（阶段二收尾门禁）— `docs/contract_v1.md` 🔶 v1.0-rc 可冻结（2026-11-20），待用户最终确认
 
-冻结内容：物理/几何语义（尺度、坐标、原语动作、事件语义、缺测约定）+ **观测空间、动作空间、奖励接口（已按 [docs/rl_algorithm_design.md](docs/rl_algorithm_design.md) 填入，2026-11-20）**。观测空间定稿为 16 通道全图信念张量（替代局部占据栅格窗口）；事件语义新增 `Pickup` / `DestinationFeed`（待实现 + 单测同步）。契约生效后的任何变更：先经用户确认 → 记入 `docs/CHANGELOG.md` → 单测同步更新。这是阶段三开工的硬性前置。
+冻结内容：物理/几何语义（尺度、坐标、原语动作、事件语义、缺测约定）+ **观测空间、动作空间、奖励接口（已按 [docs/rl_algorithm_design.md](docs/rl_algorithm_design.md) 填入，2026-11-20）**。观测空间定稿为 16 通道全图信念张量（替代局部占据栅格窗口）；事件语义新增 `Pickup` / `DestinationFeed` **已实现 + 单测同步（2026-11-20，`tests/test_interaction.py` / `tests/test_env.py`）**。契约生效后的任何变更：先经用户确认 → 记入 `docs/CHANGELOG.md` → 单测同步更新。这是阶段三开工的硬性前置。
 
 ### 阶段二验收标准
 
@@ -161,7 +161,7 @@
 - [x] 运动学原语序列终态与解析解一致；逻辑格同步正确（含与 BamerEnv 交叉验证，`tests/test_kinematics.py`）；
 - [x] 点云可视化图通过目检（墙前点云贴墙、开口处穿透、走廊纵深、点云残影——`docs/lidar_*.png`，2026-11-19 目检通过；附 `_demo_pointcloud.gif` 578 步完整任务录像）；
 - [x] 数据 IO 往返一致性测试通过（`tests/test_dataio.py`）；
-- [ ] `contract_v1.md` 整体冻结（obs/action/reward 三项已按用户确认填写 2026-11-20；`Pickup`/`DestinationFeed` 事件实现 + 单测同步后冻结）。
+- [ ] `contract_v1.md` 整体冻结（obs/action/reward 三章已按用户确认填写；`Pickup`/`DestinationFeed` 已实现 + 单测同步（2026-11-20）——**待用户最终确认冻结**）。
 
 ---
 
@@ -180,14 +180,14 @@
 
 ### 开工前置（硬性）
 
-1. `contract_v1.md` 已冻结（M2.6）——三章已按用户确认填写（2026-11-20），待整体冻结；
+1. `contract_v1.md` 已冻结（M2.6）——三章已按用户确认填写（2026-11-20），新事件已实现+单测，**待用户最终确认冻结**；
 2. ~~用户给出算法设计文档~~ ✅ [docs/rl_algorithm_design.md](docs/rl_algorithm_design.md)（2026-11-20 定稿：SMDP Dueling DQN + 三动作 option + 16 通道信念 + D8 奖励 + 评估协议）；
-3. `algo/` 设施骨架就位并冒烟通过。
+3. ~~`algo/` 设施骨架就位并冒烟通过~~ ✅ 2026-11-20：`algo/` 全模块（belief/actions/executor/network/replay/agent/trainer/eval + configs 三臂 + tools/train.py 入口）按 §8 冒烟顺序实现并通过 5 组单测；端到端分钟级冒烟通过；**同种子复现逐行一致**（阶段三验收项 1 预演通过）；全知 BFS 参照（官方图 50 步）就绪。
 
 ### 阶段三验收标准
 
-- [ ] 复现性：同种子两次训练评估曲线一致（确定性允许 GPU 非严格误差，需声明）；
-- [ ] 评估报告：成功率 / 总步数 / 与 BFS 参照的差距，固定 seed 套件；
+- [x] 复现性：同种子两次训练评估曲线一致（确定性允许 GPU 非严格误差，需声明）——冒烟级已验证逐行一致（`tests/test_trainer_smoke.py`），正式训练规模待服务器复验；
+- [ ] 评估报告：成功率 / 总步数 / 与 BFS 参照的差距，固定 seed 套件（设施就绪：`algo/eval.py` + `tools/train.py --eval`）；
 - [ ] 最优路线复盘：最终策略在默认场景的完整派送回放（成果要求 5）。
 
 ---

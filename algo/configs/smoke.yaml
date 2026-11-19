@@ -1,0 +1,32 @@
+# 冒烟配置（本地分钟级管线验证，非训练成绩）
+# 用法：python tools/smoke_train.py --config algo/configs/smoke.yaml
+arm: C                       # 从头直训（前馈版本身即消融对照）
+stage1_options: 120          # option 预算（冒烟级）
+stage0_options: 0
+max_episodes_per_stage: 30
+
+env_randomize: true
+env_max_steps: 300
+lidar_n_beams: 60            # 冒烟降束提速（D4 默认 180，正式配置不降）
+lidar_max_range: 2.0
+maze_n: 16
+
+gamma: 0.99
+lr: 1.0e-4
+batch_size: 16
+target_sync_options: 50
+warmup_options: 20
+lambda_aux: 0.5
+grad_clip: 10.0
+eps_start: 0.25              # 冒烟加大探索噪声起点，保证 option 多样性
+eps_end: 0.05
+eps_anneal_options: 120
+capacity: 2000
+aux_head: true
+use_traj: true
+use_gru: false
+
+seed: 0
+out_dir: algo/runs/smoke
+checkpoint_every_options: 60
+smoke: true
