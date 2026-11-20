@@ -351,11 +351,13 @@ class Trainer:
             mask = legal_mask(self.belief)
             action = self.agent.act(s, mask)
             unknown_before = self.belief.ledger.unknown_count()
+            # 本 option 开始前的已访快照：executor 执行期间每步 observe 都会把
+            # 走过的格写入 visited，执行后再取会把本路径自身算作"已探索"。
+            visited_before = set(self.belief.visited)
 
             result = self.executor.run(self.env, action)
-            # 诊断量须在 commit_option 之前取（visited 为本 option 开始前的已访集）
             move_steps += max(len(result.path) - 1, 0)
-            repeat_moves += _repeat_moves(result.path, self.belief.visited)
+            repeat_moves += _repeat_moves(result.path, visited_before)
             if self.agent.last_q_stats is not None:
                 q_rows.append(self.agent.last_q_stats)
             unknown_after = self.belief.ledger.unknown_count()
