@@ -26,6 +26,7 @@ agent 内部流（ε / replay 采样）+ torch 初始化，全部显式登记。
 """
 import csv
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -95,6 +96,12 @@ class TrainConfig:
     # --- 训练中周期评估（mini held-out 套件，greedy 不污染训练流） ---
     eval_every_options: int = 0       # 0 = 关闭；>0 → 每 N options 跑一次
     eval_mini_seeds: int = 3          # mini 套件种子数（seed 派生固定，跨实验可比）
+    # --- 势能拉势 shaping（2026-11-21 A/C 探索塌缩修复，默认关 = 冻结契约行为） ---
+    # F = γ^τ·Φ(s') − Φ(s)，Φ = 已知墙槽位比例。与 SMDP γ^τ 折扣一致 → 最优策略
+    # 不变（Ng et al. 1999 / Grzes 2017 多步动作形式），只加速学习；A/C 塌缩分析
+    # 见 docs/ac_collapse_analysis.md。转正需用户确认（契约 D8 语义扩展）。
+    shape_potential: bool = False
+    shape_scale: float = 2000.0       # Φ∈[0,1] 全程拉势总量上限；2000 ≈ 2× 臂 B 每 bit 量级
     # --- 复现与产物 ---
     seed: int = 0
     out_dir: str = "algo/runs/exp"
@@ -110,6 +117,8 @@ class TrainConfig:
             raise ValueError(f"swanlab_mode 仅支持 cloud/local/offline，得到 {self.swanlab_mode!r}")
         if self.eval_every_options < 0 or self.eval_mini_seeds < 1:
             raise ValueError("eval_every_options 须 >=0，eval_mini_seeds 须 >=1")
+        if self.shape_potential and self.shape_scale <= 0:
+            raise ValueError(f"shape_potential=True 时 shape_scale 须 >0，得到 {self.shape_scale!r}")
 
     @classmethod
     def from_yaml(cls, path: str) -> "TrainConfig":
@@ -226,6 +235,21 @@ class Trainer:
     def _reward_entropy(self, result, unknown_before: int, unknown_after: int) -> float:
         """臂 B 阶段 0：信息增益（未知墙位数精确计数，1 bit = 1 分）。"""
         return -float(result.steps) + float(unknown_before - unknown_after)
+
+    def _shape_reward(self, base: float, unknown_before: int, unknown_after: int,
+                      steps: int, terminated: bool) -> float:
+        """势能拉势 shaping（Ng et al. 1999；SMDP 多步动作形式 Grzes 2017）。
+
+        F = γ^τ·Φ(s') − Φ(s)，Φ = 已知墙槽位比例（信息势，确定性派生自信念账本，
+        是策略可观测状态的函数）。与 TD target 的 γ^τ 折扣同构 → 最优策略不变，
+        只加速学习。terminated 时 Φ(s')=0（定理严格条件）；truncated 自举继续，
+        保持 Φ(s') 项。逐 episode 遥测和 ΣF = γ^T·Φ(s_T) − Φ(s_0) 有界，不可套利。
+        2026-11-21 A/C 探索塌缩修复（docs/ac_collapse_analysis.md）；默认关。
+        """
+        total = 2 * self.n * self.n
+        phi_s = (total - unknown_before) / total
+        phi_s2 = 0.0 if terminated else (total - unknown_after) / total
+        return base + (math.pow(self.cfg.gamma, steps) * phi_s2 - phi_s) * self.cfg.shape_scale
 
     # ---------- 主循环 ----------
     def run(self, resume_from: Optional[str] = None) -> Dict[str, object]:
@@ -365,6 +389,9 @@ class Trainer:
             s2 = self.belief.tensor(use_traj=cfg.use_traj)
             mask2 = legal_mask(self.belief)
             reward = self.reward_fn(result, unknown_before, unknown_after)
+            if cfg.shape_potential:
+                reward = self._shape_reward(reward, unknown_before, unknown_after,
+                                            result.steps, result.terminated)
 
             self.agent.observe(s, action, reward, s2, result.steps,
                                result.terminated, mask, mask2, gt_south, gt_west)

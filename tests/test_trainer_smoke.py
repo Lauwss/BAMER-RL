@@ -195,10 +195,51 @@ def test_repeat_moves_unit():
     print("[重复探索] OK：_repeat_moves 计数语义（起点不计/已访命中）")
 
 
+def test_potential_shaping():
+    """势能拉势 shaping（2026-11-21 A/C 塌缩修复）：公式逐项、终止分支、门控校验、端到端。"""
+    import math
+
+    cfg = tiny_cfg("algo/runs/_test_shape")
+    cfg.shape_potential = True
+    trainer = Trainer(cfg)
+    total = 2 * trainer.n * trainer.n
+    scale, gamma = cfg.shape_scale, cfg.gamma
+    base = -5.0
+    # 信息增益 10 槽、τ=10：F = γ^10·(10/total)·scale − 0（Φ(s)=0）
+    expect = base + math.pow(gamma, 10) * (10 / total) * scale
+    got = trainer._shape_reward(base, total, total - 10, 10, terminated=False)
+    assert abs(got - expect) < 1e-9, f"{got} != {expect}"
+    # 零增益（原地扫描无新信息）：F = Φ·(γ^τ − 1)·scale < 0（轻微时长代价，策略不变性下合法）
+    phi = 10 / total
+    expect0 = base + (math.pow(gamma, 3) * phi - phi) * scale
+    got0 = trainer._shape_reward(base, total - 10, total - 10, 3, terminated=False)
+    assert abs(got0 - expect0) < 1e-9 and got0 < base
+    # terminated：Φ(s')=0 → 正增益被抑制；有 Φ(s) 时为纯负项（定理严格条件）
+    assert trainer._shape_reward(base, total, total - 10, 10, terminated=True) == base
+    expect_t = base - phi * scale
+    got_t = trainer._shape_reward(base, total - 10, total - 10, 3, terminated=True)
+    assert abs(got_t - expect_t) < 1e-9
+    # 校验：开 shaping 但 scale 非法须拒绝；默认关（冻结契约行为）
+    try:
+        TrainConfig(shape_potential=True, shape_scale=0.0).validate()
+        raise AssertionError("shape_scale=0 未报错")
+    except ValueError:
+        pass
+    assert TrainConfig().shape_potential is False
+    # 端到端：开 shaping 训练可跑通且同种子确定性（两次 option 序列一致）
+    summary = trainer.run()
+    assert summary["options"] >= cfg.stage1_options
+    rows = [float(r["reward"]) for r in csv.DictReader(
+        open(os.path.join(cfg.out_dir, "episodes.csv"), encoding="utf-8"))]
+    assert len(rows) > 0 and all(math.isfinite(x) for x in rows)
+    print("[拉势shaping] OK：公式逐项、terminated 分支、门控校验、端到端确定性")
+
+
 if __name__ == "__main__":
     test_stage_plan()
     test_monitor_null_and_validation()
     test_repeat_moves_unit()
+    test_potential_shaping()
     test_end_to_end_smoke()
     test_same_seed_reproducibility()
     test_mini_eval_hook_and_csv_schema()
