@@ -7,11 +7,10 @@
              ——策略步数与参照的差距是核心报告量
     诊断量   探索区域率、墙知识率、option 数、搜寻阶段占比
 
-参照实现 = (格,朝向,任务进度) 状态空间 BFS：进度 = 已按序到访的任务点数
-（单机负载约束下合法任务序仅 2 条：Pq→Dq→Pz→Dz / Pz→Dz→Pq→Dq），到达进度
-对应任务点自动推进（拾取/派送随到达生效）。语义注意：env 侧"空手经过机器格
-即拾取"未建模——若最优路径恰好空手穿越他机格，实际执行会强制改变任务序；
-此极端拓扑差异在报告时如实注明（参照定义见 rl_algorithm_design.md §7.1）。
+参照实现 = (格,朝向,携带,送达) 状态空间 BFS（8192 态）：与 env 语义逐条一致的
+强制事件自动机——空手到达机器格强制拾取、已携带到达映射终点格强制送达、
+已送达不再拾取、单机负载。规则 A（2026-11-20 用户确认）的拓扑性代价（机器
+挡在唯一路径上时的强制拾取序）由此如实计入参照，策略 vs 参照差距严格公平。
 
 R1：本模块为评估侧（特权角色），GT 迷宫/布点仅用于参照计算与指标统计，
 绝不进入策略输入。
@@ -22,11 +21,10 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from bamer_env.scene import Scene
 
+from .actions import DELIVERY_MAP
 from .belief import HEADINGS, BeliefState
 
 Cell = Tuple[int, int]
-
-_TURN = {"TL": -1, "TR": +1, "TB": +2}
 
 
 @dataclass
@@ -66,64 +64,65 @@ class EvalSummary:
 
 
 # ---------- 全知 BFS 参照 ----------
-def _task_orders() -> List[List[str]]:
-    """单机负载下的合法任务点序（拾取 P 在其派送 D 前，配对固定）：仅 2 条。"""
-    return [["quyuan", "chuguo", "zhaojun", "xihan"],
-            ["zhaojun", "xihan", "quyuan", "chuguo"]]
-
-
 def omniscient_reference(scene: Scene) -> Optional[int]:
-    """全知参照：已知全图 + 布点下，最优任务序的 (格,朝向) 最短路径总步数。
+    """全知参照：已知全图 + 布点下，任务规则下的最短 (格,朝向) 路径总步数。
 
-    状态 = (格, 朝向, 进度)；到达进度对应任务点 → 进度自动 +1（拾取/派送随
-    到达自动生效，无需额外动作）；进度走满 = 任务完成。两条合法序取最小；
+    与 env 语义**逐条一致**的强制事件自动机（2026-11-20 规则 A 确认后升级）：
+    状态 = (格, 朝向, carrying, 送达集)；到达机器格且空手且未送达 → 强制拾取
+    （0 额外步）；已携带且映射终点格到达 → 强制送达（0 额外步）；已送达机器
+    不再拾取；单机负载。两条移动边 = 1 个 D5 原语 = 1 步（R4 转向计步）。
+    有效 (carrying, delivered) 组合 8 种 × 1024 = 8192 状态，BFS 精确最优。
     不可达返回 None（场景校验已保证任务点互达，理论不会发生）。
     """
     maze = scene.maze
+    machines = dict(scene.state_machines)
+    dests = dict(scene.destinations)
+    n = maze.n
 
     def open_gt(cell: Cell, direction: str) -> bool:
         return not maze.has_wall(cell[0], cell[1], direction)
 
-    waypoints_by_order = []
-    for order in _task_orders():
-        pts = []
-        for name in order:
-            pts.append(scene.state_machines[name] if name in scene.state_machines
-                       else scene.destinations[name])
-        waypoints_by_order.append(pts)
+    def settle(cell: Cell, c: int, dq: int, dz: int):
+        """到达事件的强制结算（与 interaction.enter_events 同序：先拾取后派送）。"""
+        for mname, mcell in machines.items():
+            if cell == mcell:
+                if c == 0 and (mname == "quyuan" and not dq or mname == "zhaojun" and not dz):
+                    c = 1 if mname == "quyuan" else 2          # 强制拾取（单机负载：空手才触发）
+        for mname, dname in DELIVERY_MAP.items():
+            if c == (1 if mname == "quyuan" else 2) and dests.get(dname) == cell:
+                if mname == "quyuan":
+                    dq, c = 1, 0                               # 强制送达，双手解放
+                else:
+                    dz, c = 1, 0
+        return c, dq, dz
 
-    best = None
-    for waypoints in waypoints_by_order:
-        cost = _staged_bfs_cost(maze.n, scene.start, scene.start_heading, waypoints, open_gt)
-        if cost is not None and (best is None or cost < best):
-            best = cost
-    return best
-
-
-def _staged_bfs_cost(n: int, start: Cell, start_heading: str,
-                     waypoints: List[Cell], open_fn) -> Optional[int]:
-    """(格,朝向,进度) BFS：进度 k 表示 waypoints[:k] 已按序到访；到达 waypoints[k]
-    自动推进。每条边 = 1 个 D5 原语 = 1 步（R4 转向计步）。"""
-    h0 = HEADINGS.index(start_heading)
-    start = (start[0], start[1], h0, 0)
+    from collections import deque
+    h0 = HEADINGS.index(scene.start_heading)
+    c0, dq0, dz0 = settle(scene.start, 0, 0, 0)               # 出生格即机器/终点格的防御
+    start = (scene.start[0], scene.start[1], h0, c0, dq0, dz0)
+    if dq0 and dz0:
+        return 0
     seen = {start}
-    dq = deque([(start, 0)])
-    while dq:
-        (x, y, h, k), cost = dq.popleft()
-        if k < len(waypoints) and (x, y) == waypoints[k]:
-            k += 1                              # 到达任务点：拾取/派送自动生效（0 额外步）
-            if k == len(waypoints):
-                return cost
-        for d, (dx, dy) in zip(HEADINGS, ((0, 1), (1, 0), (0, -1), (-1, 0))):
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < n and 0 <= ny < n and open_fn((x, y), d) \
-                    and (nx, ny, h, k) not in seen:
-                seen.add((nx, ny, h, k))
-                dq.append(((nx, ny, h, k), cost + 1))
-        for prim, dh in _TURN.items():
-            if (x, y, (h + dh) % 4, k) not in seen:
-                seen.add((x, y, (h + dh) % 4, k))
-                dq.append(((x, y, (h + dh) % 4, k), cost + 1))
+    dq_queue = deque([(start, 0)])
+    while dq_queue:
+        (x, y, h, c, dqv, dzv), cost = dq_queue.popleft()
+        if dqv and dzv:
+            return cost
+        # F 边：仅当前朝向 d = HEADINGS[h]（转向由独立的旋转边承担，R4 计步）
+        d = HEADINGS[h]
+        dx, dy = ((0, 1), (1, 0), (0, -1), (-1, 0))[h]
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < n and 0 <= ny < n and open_gt((x, y), d):
+            c2, dq2, dz2 = settle((nx, ny), c, dqv, dzv)
+            ns = (nx, ny, h, c2, dq2, dz2)          # 前进不改朝向
+            if ns not in seen:
+                seen.add(ns)
+                dq_queue.append((ns, cost + 1))
+        for dh in (-1, +1, +2):                     # TL/TR/TB 原地旋转，各计 1 步
+            ns = (x, y, (h + dh) % 4, c, dqv, dzv)
+            if ns not in seen:
+                seen.add(ns)
+                dq_queue.append((ns, cost + 1))
     return None
 
 
