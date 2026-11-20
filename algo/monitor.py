@@ -93,7 +93,10 @@ class SwanLabMonitor(NullMonitor):
         self._sw.log({k: v for k, v in clean.items() if v is not None}, step=step)
 
     def log_summary(self, payload: Dict[str, object]) -> None:
-        clean = {f"summary/{k}": v for k, v in payload.items() if v is not None}
+        # 只上报标量：summary 含 stages（字符串列表）等非数值字段，swanlab 解析
+        # 非媒体列表会报 ERROR（冒烟实测，非致命但污染日志）。
+        clean = {f"summary/{k}": v for k, v in payload.items()
+                 if isinstance(v, (int, float))}
         self._sw.log(clean)
 
     def finish(self) -> None:
