@@ -151,9 +151,9 @@
 - `Classifier` 协议（接口）：真实识别模型（深度学习分类）作为可插拔实现，另提供 GT 直通占位；
 - **归属待确认（D9）**：图像数据集构建与分类模型训练是否在本项目范围内、由谁主导——需用户拍板，暂只做接口与占位。
 
-### M2.6 契约冻结（阶段二收尾门禁）— `docs/contract_v1.md` 🔶 v1.0-rc 可冻结（2026-11-20），待用户最终确认
+### M2.6 契约冻结（阶段二收尾门禁）— `docs/contract_v1.md` ✅ **v1.0 已冻结（2026-11-20 用户确认）**
 
-冻结内容：物理/几何语义（尺度、坐标、原语动作、事件语义、缺测约定）+ **观测空间、动作空间、奖励接口（已按 [docs/rl_algorithm_design.md](docs/rl_algorithm_design.md) 填入，2026-11-20）**。观测空间定稿为 16 通道全图信念张量（替代局部占据栅格窗口）；事件语义新增 `Pickup` / `DestinationFeed` **已实现 + 单测同步（2026-11-20，`tests/test_interaction.py` / `tests/test_env.py`）**。契约生效后的任何变更：先经用户确认 → 记入 `docs/CHANGELOG.md` → 单测同步更新。这是阶段三开工的硬性前置。
+冻结内容：物理/几何语义（尺度、坐标、原语动作、事件语义、缺测约定）+ 观测空间、动作空间、奖励接口（依据 [docs/rl_algorithm_design.md](docs/rl_algorithm_design.md)）。观测空间定稿为 16 通道全图信念张量；事件语义新增 `Pickup` / `DestinationFeed` **已实现 + 单测同步（2026-11-20）**。四项收尾决议同日落定：规则 A（首达即拾取）、**D9 = GT 直通直到验收**、ImageFeed 载荷算法侧仅 `image` 字段、无回波 = 束对齐 NaN 填充。契约生效后的任何变更：先经用户确认 → 记入 `docs/CHANGELOG.md` → 单测同步更新 → 版本号 v1.x 递增。
 
 ### 阶段二验收标准
 
@@ -161,7 +161,7 @@
 - [x] 运动学原语序列终态与解析解一致；逻辑格同步正确（含与 BamerEnv 交叉验证，`tests/test_kinematics.py`）；
 - [x] 点云可视化图通过目检（墙前点云贴墙、开口处穿透、走廊纵深、点云残影——`docs/lidar_*.png`，2026-11-19 目检通过；附 `_demo_pointcloud.gif` 578 步完整任务录像）；
 - [x] 数据 IO 往返一致性测试通过（`tests/test_dataio.py`）；
-- [ ] `contract_v1.md` 整体冻结（obs/action/reward 三章已按用户确认填写；`Pickup`/`DestinationFeed` 已实现 + 单测同步（2026-11-20）——**待用户最终确认冻结**）。
+- [x] `contract_v1.md` 整体冻结（**v1.0，2026-11-20 用户确认**；Pickup/DestinationFeed 已实现 + 单测同步）。
 
 ---
 
@@ -235,7 +235,7 @@ BAMER-RL/
 | D6 | 决策级动作空间（离散/连续/分层） | 已定 | 用户 | 2026-11-20 定 = 分层 option {Explore(点)/Pick(标签)/Deliver}，见 [docs/rl_algorithm_design.md](docs/rl_algorithm_design.md) §3 |
 | D7 | 观测表示（原始点云/占据栅格/极坐标向量） | 已定 | 用户 | 2026-11-19 选定 **方案 B 局部占据栅格**（算法侧输入）；2026-11-20 定稿 = **16 通道全图信念张量 (16,16,16) uint8**（docs/rl_algorithm_design.md §2，替代局部窗口）；点云/极坐标渲染保留为展示层 |
 | D8 | 奖励函数 | 已定 | 用户 | 2026-11-20 定 = −1/步 + 首次识别 +100/台 + 终点发现 +100/个 + 送达 +300/台；碰撞/超时无罚（docs/rl_algorithm_design.md §5） |
-| D9 | 图像识别模块（数据集/分类器）归属 | **待定** | **用户** | 暂只做接口 + GT 占位 |
+| D9 | 图像识别模块（数据集/分类器）归属 | 已定 | 用户 | 2026-11-20 确认 = **维持 GT 直通直到验收**：`CameraUnit`/`GTAssetClassifier` 占位贯穿管线；真实分类模型不在当前范围，验收前如有需要另行立项 |
 | D10 | RL 算法选型与网络结构 | 已定 | 用户 | 2026-11-20 定 = SMDP Dueling DQN + 三分支 FCN + 辅助补墙头（GRU 预留开关），见 docs/rl_algorithm_design.md §4 |
 
 ---
