@@ -27,12 +27,14 @@ from .actions import N_OPTIONS
 from .network import FCQNet, dueling_q
 
 
-def gt_directional_walls(gt_south: np.ndarray, gt_west: np.ndarray) -> np.ndarray:
+def gt_directional_walls(gt_south, gt_west) -> "torch.Tensor":
     """规范形式 GT 墙线 (B,2,n,n) → 4 方向 GT 墙值 (B,4,n,n) float（0/1）。
 
+    接受 numpy 数组或 torch 张量（2026-11-20 设备无关化：输入已在 GPU 时全程
+    GPU 切片赋值，免去 CPU 中转 + H2D 传输；纯 0/1 重排，数值逐位一致）。
     布局 [B,C,x,y] 与 belief.tensor 一致；N/E 外边框恒 1（有墙，封闭场地先验）。
     """
-    south = torch.as_tensor(gt_south, dtype=torch.float32)   # (B,1,n,n) → (B,n,n)
+    south = torch.as_tensor(gt_south, dtype=torch.float32)
     west = torch.as_tensor(gt_west, dtype=torch.float32)
     south = south.squeeze(1) if south.dim() == 4 else south
     west = west.squeeze(1) if west.dim() == 4 else west
@@ -85,6 +87,10 @@ class SMDPDQNAgent:
         self.options_seen = 0
         self.learn_steps = 0
         self._last_target_sync = 0
+        # γ 标量张量缓存（学习步逐次重建 torch.tensor(gamma, device) 的 H2D 开销）
+        self._gamma_t = torch.tensor(float(gamma), device=self.device)
+        # 最近一次前向的 Q 统计（监控用，零额外成本；ε-random 步为 None）
+        self.last_q_stats: Optional[Dict[str, float]] = None
 
     # ---------- ε 调度 ----------
     def epsilon(self, options_seen: Optional[int] = None) -> float:
@@ -106,12 +112,16 @@ class SMDPDQNAgent:
         if legal.size == 0:
             raise RuntimeError("合法选项集为空，无法选择动作")
         eps = self.epsilon()
+        self.last_q_stats = None                 # ε-random 分支无前向，不留旧值
         if not greedy and self._eps_rng.random() < eps:
             return int(legal[self._eps_rng.integers(legal.size)])
         t = torch.as_tensor(tensor, device=self.device).unsqueeze(0)
         m = torch.as_tensor(mask, device=self.device).unsqueeze(0)
         out = self.online(t, compute_aux=False)
         q = dueling_q(out["advantage"], out["value"], m)          # (1,259)，非法=−inf
+        q_legal = q[0, torch.as_tensor(legal, device=self.device)]
+        self.last_q_stats = {"q_mean": float(q_legal.mean().item()),
+                             "q_max": float(q.max().item())}
         return int(q.argmax(dim=1).item())
 
     # ---------- 经验与学习 ----------
@@ -154,7 +164,7 @@ class SMDPDQNAgent:
         mask_a2 = torch.as_tensor(batch["mask_a2"], device=dev)
 
         # TD：Q_online(s, a) vs Double-DQN target
-        out = self.online(s)
+        out = self.online(s, compute_aux=self.lambda_aux > 0)
         q = dueling_q(out["advantage"], out["value"], mask_b)
         q_sa = q.gather(1, a.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
@@ -164,30 +174,36 @@ class SMDPDQNAgent:
             out2_t = self.target(s2, compute_aux=False)
             q2_target = dueling_q(out2_t["advantage"], out2_t["value"], mask_a2)
             q_next = q2_target.gather(1, a2).squeeze(1)
-            discount = torch.pow(torch.tensor(self.gamma, device=dev), tau)   # SMDP γ^τ
+            discount = torch.pow(self._gamma_t, tau)              # SMDP γ^τ（缓存标量张量）
             y = r + discount * (~terminal).float() * q_next
         td_loss = nn.functional.mse_loss(q_sa, y)
 
-        # 辅助任务：补全未知墙位（BCE 只在输入 unknown 槽位；共享主干两路反传）
+        # 辅助任务：补全未知墙位（BCE 只在输入 unknown 槽位；共享主干两路反传）。
+        # 2026-11-20 无同步化改造：掩码均值 = sum(bce·mask)/cnt（cnt.clamp(min=1)），
+        # 全 GPU 完成取代 unknown.any() 的中途 D2H 同步；cnt=0 时 bce=0，与原
+        # "跳过"语义等值（常数 0 无梯度）。GT 换算改为 GPU 张量直入（设备无关
+        # 版 gt_directional_walls），免去 CPU 中转 + (B,4,n,n) H2D 传输。
         loss = td_loss
-        aux_loss_val = 0.0
+        bce_t = torch.zeros_like(td_loss)
         if self.lambda_aux > 0 and "aux_logits" in out:
             aux_logits = out["aux_logits"]                        # (B,4,n,n)
-            unknown = (s[:, :4] == 0)                             # 输入墙位通道=0 → 未知槽位
-            gt = gt_directional_walls(batch["gt_south"], batch["gt_west"]).to(dev)
-            if unknown.any():
-                bce = nn.functional.binary_cross_entropy_with_logits(
-                    aux_logits[unknown], gt[unknown], reduction="mean")
-                loss = loss + self.lambda_aux * bce
-                aux_loss_val = float(bce.detach())
+            unknown = (s[:, :4] == 0)                             # (B,4,n,n) 逐方向未知掩码
+            gt = gt_directional_walls(torch.as_tensor(batch["gt_south"], device=dev),
+                                      torch.as_tensor(batch["gt_west"], device=dev))
+            bce_all = nn.functional.binary_cross_entropy_with_logits(
+                aux_logits, gt, reduction="none")
+            bce_t = (bce_all * unknown).sum() / unknown.sum().clamp(min=1)
+            loss = td_loss + self.lambda_aux * bce_t
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
         self.optimizer.step()
         self.learn_steps += 1
-        return {"td_loss": float(td_loss.detach()), "aux_loss": aux_loss_val,
-                "total_loss": float(loss.detach())}
+        # 单次 D2H：三个损失一次 .tolist()（原 td/total 各一次 .float() 同步）
+        td_v, aux_v, tot_v = torch.stack(
+            [td_loss.detach(), bce_t.detach(), loss.detach()]).tolist()
+        return {"td_loss": td_v, "aux_loss": aux_v, "total_loss": tot_v}
 
     # ---------- 课程切换（§6.2 阶段切换机制） ----------
     def begin_stage1(self, eps_restart: float = 0.05) -> None:

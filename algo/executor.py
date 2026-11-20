@@ -103,7 +103,13 @@ class Executor:
 
     # ---------- 规划 ----------
     def plan(self, target: Cell) -> Optional[List[str]]:
-        """在最新信念图上规划到 target 的原语序列（1024 态 BFS）。"""
+        """在最新信念图上规划到 target 的原语序列（1024 态 BFS）。
+
+        实测注记（2026-11-20）：曾试做 numpy 前沿扩展版，微基准 0.85ms vs 标量
+        0.56ms（0.7×，更慢）——标量版提前终止只访问路径半径内 ~150 态，而逐层
+        numpy 的固定开销（fancy indexing/unique/分配）在 1024 态规模摊不平，
+        短路占优时标量更快。负结果详见 CHANGELOG，勿再重复此优化方向。
+        """
         b = self.belief
         return bfs_path(b.n, b.cell, b.heading, target, b.open_boundary)
 

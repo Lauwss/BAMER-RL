@@ -2,6 +2,163 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-20 — 学习步 host 开销优化（用户拍板"先做①"）
+
+### 改动（`algo/agent.py`，学习语义不变）
+
+1. **γ 标量张量缓存**：`__init__` 预建 `self._gamma_t`，学习步不再逐次
+   `torch.tensor(gamma, device)`（省一次 H2D + 对象构造）；
+2. **`gt_directional_walls` 设备无关化**：接受 numpy 或 torch 张量，纯 0/1 重排
+   改 torch 切片赋值（数值逐位一致）——调用侧先把 GT 传上 GPU 再换算，免去
+   CPU 中转 + (B,4,n,n) float 的 H2D 传输；
+3. **辅助 BCE 无同步化**：`unknown.any()` 中途 D2H 同步 → 全 GPU 掩码均值
+   `sum(bce·mask)/cnt.clamp(min=1)`（数学等价：子集均值 vs 掩码均值；cnt=0 时
+   bce=0 与"跳过"等值，常数 0 无梯度。浮点求和序差 ~1e-7，traj 可能微移，
+   契约无路径锁定）；
+4. **单次 D2H 损失上报**：td/aux/total 三损失 `torch.stack().tolist()` 一次
+   同步（原 td/total 各一次 `.float()`）；
+5. **`compute_aux=self.lambda_aux>0` 守卫**：λ_aux=0 消融臂不再白算辅助头。
+
+### 实测（RTX 4060 / 正式配置量级）
+
+- 学习步：10.84 → **7.11 ms/call（−34%）**（先插桩定位：GPU 纯算 2.7ms，
+  host 开销 ~7ms——逐损失同步/逐步建 gamma 张量/GT CPU 中转是主犯）
+- 端到端 episode：3.78 → **3.16 s（−16%）**；**相对本日起点 4.25s 累计 −26%**
+- 14/14 测试全过（td_loss 与改前逐位一致；aux_loss ~1e-7 浮点序差）
+- GPU 上限探针（顺带登记）：batch 64→1024 学习步 2.7→32ms——卡未吃饱，
+  3090 级换卡预计端到端 <5%，不值得；剩余瓶颈=单线程 Python 数据供给。
+
+## 2026-11-20 — 雷达/信念账本向量化提速（性能优化，语义逐位一致）
+
+### 改动（束间并行 DDA，结果与标量版逐位一致）
+
+1. `bamer_env/maze.py`：构造时缓存 numpy 墙数组（墙线不可变）；新增
+   `has_wall_batch(xs, ys, dirs)`（语义逐条镜像 `has_wall`，N/E 越界=外边框墙）。
+2. `bamer_mouse/lidar.py`：新增 `_raycast_parallel`（束间锁步 DDA，数学全向量化；
+   三个逐位一致保证：tie 同式 tx<=ty、每束查询序列不变、t>max_range 严格大于）；
+   `Lidar.scan` 新增可选 `wall_query_batch`（缺省退化标量回调，结果一致）。
+   标量 `raycast` 保留（对拍参照/单测用）。
+3. `algo/belief.py`：`update_scan` 重写为锁步 DDA——每轮每束恰跨一条边界，穿越
+   侧直接给出规范槽位（E/N=外侧格带护栏、W/S=内侧格，与 `_slot_between` 逐条
+   对齐）；标记收集后批量写入，`_mark` 单调+wall 恒胜 → 先 free 后 wall 的批量
+   写入与逐束交错写入终态逐位一致。顺带消除标量版噪声越界场景的负索引回绕
+   隐患（穿出网格的束即刻终止；外边框恒有墙，正常束不受影响）。不再 import
+   walk_cells（pointcloud.occupancy_grid 仍用）。
+4. `bamer_env/env.py`：`_scan_now` 传入 `has_wall_batch`。
+
+### 实测（RTX 4060 Laptop / CUDA / 正式配置量级 180 束）
+
+- 雷达单帧：0.799 → **0.332 ms**（**2.4×**，test_lidar 性能项）
+- `update_scan`/帧：~2.0 → <0.4 ms（**≥5×**，剖析榜除名）
+- Python 函数调用/episode：386k → **88.6k**（**−77%**）
+- 端到端 episode（1000 步跑满）：均值 4.25 → **3.78 s**（−11%——瓶颈已转移到
+  学习步 GPU 小批次传输 ~45% 与 BFS 执行器纯 Python 规划；进一步提速方向是
+  executor BFS 向量化/网络 CPU 化，本轮未做）
+
+### BFS 前沿扩展：尝试后回退（负结果登记）
+
+executor BFS 的 numpy 前沿扩展版已实现并用 1795 例随机场景验证**步数零不一致**
+（4.8% 等长不同路，tie-breaking 差异，均最优），但微基准 **0.85ms vs 标量
+0.56ms（0.7×，更慢）**——标量版提前终止只访问路径半径内 ~150 态，逐层 numpy
+的固定开销（fancy indexing / unique / 分配）在 1024 态规模摊不平。**已回退**，
+`Executor.plan` 维持标量 `bfs_path`；教训：向量化不是普适提速，小状态空间 +
+提前终止的场景 Python 顺序循环反而占优。
+
+### 回归
+
+14/14 测试全过，含逐位一致类：lidar 解析解/噪声逐位复现、D7 复核、账本手算、
+同种子训练复现逐行一致。修复过程中账本手算测试曾抓出 S 穿越槽位误镜像
+（外侧格误用 → 负索引回绕），已修正为与 `_slot_between` 逐条一致。
+
+## 2026-11-20 — 探索质量诊断指标 + Mean Q-value 监控（用户提出补充）
+
+### 新增监控指标（episodes.csv 新列 + swanlab 曲线）
+
+1. **重复探索率** `repeat_ratio` → `explore/repeat_ratio`：
+   ρ_repeat = 落入已探索格的位移步数 / 实际位移步数。位移 = `OptionResult.path`
+   相邻格变化（碰撞/转向天然不计）；已访集取**本 option 开始前**的信念 visited
+   （BFS 路径无环，option 内自环不存在）。纯函数 `trainer._repeat_moves` 有单测。
+2. **单位探索成本的信息增益** `info_gain_per_move` → `explore/info_gain_per_move`：
+   η_info = (episode 末已知墙槽位 − 初始已知) / 实际位移步数（槽位 = 2n²）。
+3. **Mean/Max Q-value** `q_mean`/`q_max` → `learn/q_mean`/`learn/q_max`：
+   `agent.act` 贪心分支零额外成本顺带统计（合法动作 Q 均值 / 全局 max），
+   ε-random 步无前向 → 不计入。q_max 用于观察价值异常增长。
+
+### 对照用户指标表
+
+Episode Reward ✓（train/reward）· Success Rate ✓（mini eval eval/success_rate +
+train/success）· Episode Length ✓（train/steps）· TD Loss ✓（learn/td_loss）·
+Mean Q-value ✓（本次新增 learn/q_mean，附带 q_max）。
+
+### 文件
+
+`algo/agent.py`（act 暴露 last_q_stats）、`algo/trainer.py`（诊断累计 + 行字段 +
+`_repeat_moves`）、`algo/monitor.py`（4 条新曲线映射）、
+`tests/test_trainer_smoke.py`（+`test_repeat_moves_unit`；CSV schema 断言扩充）。
+14/14 测试过（同种子复现不变——诊断量只读）。
+
+## 2026-11-20 — SwanLab 实验管理 + 训练中 mini 评估（用户拍板：云端 + 加 mini 套件）
+
+### 新增
+
+1. **`algo/monitor.py`**：`NullMonitor`（no-op 替身）+ `SwanLabMonitor` +
+   `build_monitor(cfg)`。可选依赖——`cfg.swanlab=False`（默认）或未安装 swanlab
+   自动降级，冒烟/回归零影响。step 轴 = 全局 option 计数（跨 stage 连续）；
+   指标分组 `train/ explore/ learn/ stage/ eval/ summary/`；init 携带全量
+   TrainConfig 供跨实验对比。云端模式需先 `swanlab login`。
+2. **TrainConfig 新键**（默认值均=关闭，不破坏复现）：
+   `swanlab: false` / `swanlab_project: BAMER-RL` / `swanlab_mode: cloud|local|offline`
+   （validate 拒绝非法值）；`eval_every_options: 0`（0=关）+ `eval_mini_seeds: 3`。
+3. **训练中 mini 评估 hook**：每 `eval_every_options` 跑一次 greedy held-out
+   mini 套件（恒用 stage1 拓扑、种子由 master seed 派生固定可比）——`evaluate()`
+   纯贪心只读，不写 buffer、不占训练种子流（同种子复现测试仍逐行一致）。
+   正式三臂配置 `eval_every_options: 10000`，smoke 保持 0。
+4. **episodes.csv 补 loss 分项列**：新增 `td_loss` / `aux_loss`（episode 内学习步
+   均值；原只有 total 的 `mean_loss`）——补 monitor 前的数据缺口。
+5. `summary.json` 新增 `options_per_sec` 吞吐字段。
+
+### 文件
+
+- 新增 `algo/monitor.py`；修改 `algo/trainer.py`（4 个 hook + `_run_mini_eval` +
+  loss 分项）、`algo/configs/*.yaml`（5 键）、`requirements.txt`（swanlab==0.10.6，
+  可选）、`tests/test_trainer_smoke.py`（+2 测试：monitor 关闭路径/校验、mini
+  hook 端到端 + CSV schema）。
+
+## 2026-11-20 — 训练迷宫拓扑升级：braided 赛图匹配（用户确认）
+
+### 背景（实测，非破坏契约——全部新参数有默认值 = 旧行为）
+
+- 验收图 `default_maze_ppt.json` 是 **braided 有环迷宫**：可达子图 215/256 格、
+  **37 环**、非起点死胡同仅 8 个（环/格 0.172）。
+- 此前训练 `Maze.random_maze(seed)` 默认 `braiding=0.0` → **全用 perfect maze
+  （0 环、~26 死胡同）**，与验收图拓扑失配。
+- 生成器死胡同开洞上限只有 ~0.10 环/格（braiding=1.0 → 27 环），追不上 0.172——
+  官方赛图的环来自人为平行长廊，不经死胡同。
+
+### 改动（4 处）
+
+1. `bamer_env/maze.py`：`random_maze` 新增 `target_loops` 参数——先按 `braiding`
+   开死胡同，再随机敲内部墙补环到目标（连通迷宫中敲墙恒 +1 环、不破坏连通性）；
+   新增 `_open_interior_edges` 辅助。默认 None = 旧行为。
+2. `bamer_env/env.py`：`BamerEnv` 新增 `maze_braiding`（默认 0.0）与
+   `maze_loops_range`（默认 None，非法区间构造时拒绝）构造参数，randomize 分支
+   用 `np_random` 采样目标环数（同 reset 种子逐墙可复现）。
+3. `algo/trainer.py` + `algo/configs/*.yaml`：`TrainConfig` 新增
+   `maze_braiding_stage0/stage1`、`maze_loops_stage0/stage1`（默认 0.0/None =
+   旧行为）；`_build_env` 按 stage 取参（臂 C 的 "full" 归入 stage1 档）。三臂配置
+   统一：**stage0 = braiding 0.0 + 补环 U[0,30]（练死胡同回溯与系统覆盖），
+   stage1 = braiding 0.8 + 补环 U[25,50]（锚定验收图 37 环/215 格）**；臂 C/smoke
+   用 stage1 值。
+4. `tools/train.py`：`_topology_kwargs(cfg)` 使 held-out 评估工厂与场景复现 env
+   使用与 stage1 相同拓扑（两处必须一致，否则参照场景失配）。
+
+### 测试
+
+- `tests/test_env.py` 新增 `test_random_maze_target_loops`（精确补环/连通/复现/
+  默认旧行为）与 `test_env_randomize_topology`（区间生效且可复现/固定场景不受
+  影响/非法区间拒绝）；全套 14/14 文件通过（含同种子训练复现、官方图全知参照
+  仍 72 步）。
+
 ## 2026-11-20 — **契约 v1.0 冻结**（M2.6 门禁关闭）+ D9 拍板
 
 ### 用户决议（4 项，同日拍板）

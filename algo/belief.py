@@ -33,13 +33,13 @@ wall_south[x][y] asarray 后即 [x, y]）。所有通道共用同一布局，位
 上规划（见 algo/executor.py）；雷达量程 2.0 格保证 frontier 处恒有已揭示的
 相邻可进格。
 """
+import math
 import os
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 from bamer_mouse.kinematics import HEADING_DEG
-from bamer_mouse.pointcloud import walk_cells
 
 # 朝向离散化（与 bamer_env.env.HEADINGS 同序：0=N 1=E 2=S 3=W）
 HEADINGS = ("N", "E", "S", "W")
@@ -146,27 +146,106 @@ class SensingLedger:
     # ---------- 量测更新 ----------
     def update_scan(self, ranges: np.ndarray, angles: np.ndarray,
                     pose_x: float, pose_y: float, heading: str, max_range: float) -> None:
-        """一帧全扫描 → 边界感知记录（纯量测复算：bamer_mouse.pointcloud.walk_cells）。
+        """一帧全扫描 → 边界感知记录（纯量测复算）。
 
         DDA 射线穿越的格边界 = 无墙已探明（1）；回波边界（命中邻格）= 有墙已探明（2）。
         与 lidar.raycast 同一套边界推进/角点 tie 约定，噪声关闭时穿越路径与真实
         射线路径逐格一致（tests/test_pointcloud.py 已实证等价性）。
+
+        2026-11-20 向量化：束间锁步 DDA（每轮每束恰跨一条边界，穿越侧直接给出
+        规范槽位），标记收集后批量写入。与逐束标量版终态逐位一致——_mark 单调
+        且"有墙恒胜无墙"，故先全部 free 后全部 wall 的批量写入与逐束交错写入
+        同序无关；穿出网格的束即刻终止（外边框恒有墙，正常束不会走到这一步；
+        标量版在噪声越界场景存在负索引回绕隐患，此处顺带消除）。
         """
         ranges = np.asarray(ranges, dtype=float)
         angles = np.asarray(angles, dtype=float)
-        theta0 = HEADING_DEG[heading]
-        for i in range(ranges.shape[0]):
-            echo = bool(np.isfinite(ranges[i]))
-            dist = float(ranges[i]) if echo else float(max_range)
-            free, neighbor = walk_cells(pose_x, pose_y, theta0 + float(angles[i]), dist)
-            for a, b in zip(free[:-1], free[1:]):
-                slot = self._slot_between(a, b)
-                if slot is not None:
-                    self._mark(slot[0], slot[1], slot[2], W_FREE)
-            if echo and neighbor is not None and free:
-                slot = self._slot_between(free[-1], neighbor)
-                if slot is not None:
-                    self._mark(slot[0], slot[1], slot[2], W_WALL)
+        n_beams = ranges.shape[0]
+        if n_beams == 0:
+            return
+        a = np.radians(HEADING_DEG[heading] + angles)
+        dx = np.cos(a)
+        dy = np.sin(a)
+        n = self.n
+        ix = np.full(n_beams, int(math.floor(pose_x)), dtype=np.int64)
+        iy = np.full(n_beams, int(math.floor(pose_y)), dtype=np.int64)
+        eps = 1e-9
+        pos_dx, neg_dx = dx > eps, dx < -eps
+        pos_dy, neg_dy = dy > eps, dy < -eps
+        # 距离带与 walk_cells 一致：t < dist-eps 穿越；dist-eps <= t <= dist+eps
+        # 记回波邻格（不跨入）；t > dist+eps 无更多边界。无回波束 dist = 量程。
+        dist = np.where(np.isfinite(ranges), ranges, float(max_range))
+        echo = np.isfinite(ranges)
+        finished = np.zeros(n_beams, dtype=bool)
+        free_x, free_y, free_s = [], [], []      # 穿越槽位（True=south 槽 / False=west 槽）
+        wall_x, wall_y, wall_s = [], [], []      # 回波边界槽位
+
+        for _ in range(4 * int(math.ceil(dist.max())) + 8):
+            act = ~finished
+            if not act.any():
+                break
+            with np.errstate(divide="ignore", invalid="ignore"):
+                tx = np.where(pos_dx, (ix + 1 - pose_x) / dx,
+                              np.where(neg_dx, (ix - pose_x) / dx, np.inf))
+                ty = np.where(pos_dy, (iy + 1 - pose_y) / dy,
+                              np.where(neg_dy, (iy - pose_y) / dy, np.inf))
+            vert = tx <= ty                      # 角点 tie：先竖直（确定性约定）
+            t = np.minimum(tx, ty)
+            # 越带终止：t > dist+eps（无邻格记录）
+            finished |= act & (t > dist + eps)
+            # 回波边界：dist-eps <= t <= dist+eps → 记 wall 槽（echo 束才标记）
+            fin1 = act & ~finished & (t >= dist - eps)
+            if fin1.any():
+                # 槽位取内/外侧格须与 _slot_between 逐条一致：
+                # E→west[ix+1,iy]（外侧,护栏 bx<n）、W→west[ix,iy]（内侧）、
+                # N→south[ix,iy+1]（外侧,护栏 by<n）、S→south[ix,iy]（内侧）
+                bx = np.where(vert, np.where(pos_dx, ix + 1, ix), ix)
+                by = np.where(vert, iy, np.where(pos_dy, iy + 1, iy))
+                is_south = ~vert
+                valid = (is_south & (by < n)) | (~is_south & (bx < n))
+                sel = fin1 & echo & valid
+                wall_x.append(bx[sel]); wall_y.append(by[sel]); wall_s.append(is_south[sel])
+                finished |= fin1
+            # 正常穿越：t < dist-eps → 记 free 槽并跨入邻格
+            cross = act & ~finished
+            if cross.any():
+                bx = np.where(vert, np.where(pos_dx, ix + 1, ix), ix)
+                by = np.where(vert, iy, np.where(pos_dy, iy + 1, iy))
+                is_south = ~vert
+                valid = (is_south & (by < n)) | (~is_south & (bx < n))
+                sel = cross & valid
+                free_x.append(bx[sel]); free_y.append(by[sel]); free_s.append(is_south[sel])
+                # 跨入邻格；穿出网格的束即刻终止（外边框恒有墙，见 docstring）
+                stepx = np.where(vert, np.where(pos_dx, 1, -1), 0)
+                stepy = np.where(~vert, np.where(pos_dy, 1, -1), 0)
+                exits = cross & (((stepx != 0) & ((ix + stepx < 0) | (ix + stepx >= n)))
+                                 | ((stepy != 0) & ((iy + stepy < 0) | (iy + stepy >= n))))
+                finished |= exits
+                adv = cross & ~exits
+                ix += stepx * adv
+                iy += stepy * adv
+
+        # 批量标记（顺序无关性见 docstring）
+        if free_x:
+            self._mark_slots(np.concatenate(free_x), np.concatenate(free_y),
+                             np.concatenate(free_s), W_FREE)
+        if wall_x:
+            self._mark_slots(np.concatenate(wall_x), np.concatenate(wall_y),
+                             np.concatenate(wall_s), W_WALL)
+
+    def _mark_slots(self, xs: np.ndarray, ys: np.ndarray,
+                    is_south: np.ndarray, value: int) -> None:
+        """批量版 _mark：语义一致（wall 恒置 2；free 不可降级已有 wall）。"""
+        for arr, sel in ((self.sensed_south, is_south), (self.sensed_west, ~is_south)):
+            x, y = xs[sel], ys[sel]
+            if x.size == 0:
+                continue
+            if value == W_WALL:
+                arr[x, y] = W_WALL
+            else:
+                vals = arr[x, y]
+                upd = vals != W_WALL
+                arr[x[upd], y[upd]] = np.maximum(vals[upd], value)
 
     def mark_wall(self, x: int, y: int, direction: str) -> None:
         """碰撞/显式墙揭示：按方向定位规范槽位标记有墙（Collision 事件的合法消费）。"""

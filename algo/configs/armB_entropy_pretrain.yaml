@@ -10,7 +10,16 @@ env_randomize: true
 env_max_steps: 1000
 lidar_n_beams: 180
 lidar_max_range: 2.0
+swanlab: false               # SwanLab 实验管理（云端；正式训练改 true，先 swanlab login）
+swanlab_project: BAMER-RL
+swanlab_mode: cloud
+eval_every_options: 10000    # 训练中 mini held-out 评估（每 N options，3 seeds greedy）
+eval_mini_seeds: 3
 maze_n: 16
+maze_braiding_stage0: 0.0    # stage0 低环：练死胡同回溯 + 系统覆盖
+maze_loops_stage0: [0, 30]
+maze_braiding_stage1: 0.8    # stage1 匹配 braided 赛图（37 环/215 格）
+maze_loops_stage1: [25, 50]
 
 gamma: 0.99
 lr: 1.0e-4

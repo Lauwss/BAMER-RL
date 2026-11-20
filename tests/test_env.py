@@ -329,6 +329,63 @@ def test_render_rgb_array():
     print(f"[渲染] OK：rgb_array {frame.shape[1]}×{frame.shape[0]}×3")
 
 
+# ---------- 迷宫拓扑随机化（braided 赛图匹配，2026-11-20） ----------
+
+def _loop_count(m: Maze) -> int:
+    """全连通迷宫的环数 = 内部开放边数 − 格数 + 1（E/N 视角每条边只数一次）。"""
+    n = m.n
+    edges = 0
+    for y in range(n):
+        for x in range(n):
+            if x + 1 < n and not m.has_wall(x, y, "E"):
+                edges += 1
+            if y + 1 < n and not m.has_wall(x, y, "N"):
+                edges += 1
+    return edges - (n * n - 1)
+
+
+def test_random_maze_target_loops():
+    # 精确补环：braiding 基线（~21 环）< 目标 40 → 敲墙补到恰好 40
+    m = Maze.random_maze(16, seed=3, braiding=0.8, target_loops=40)
+    assert m.is_fully_connected()
+    assert _loop_count(m) == 40
+    # 目标低于 braiding 基线 → 不敲墙，环数即基线（≥ 目标）
+    m_low = Maze.random_maze(16, seed=3, braiding=0.8, target_loops=5)
+    assert _loop_count(m_low) >= 5
+    # 默认参数 = 旧行为（完美迷宫 0 环）
+    m0 = Maze.random_maze(16, seed=3)
+    assert m0.is_fully_connected() and _loop_count(m0) == 0
+    # 同种子可复现
+    a = Maze.random_maze(16, seed=9, braiding=0.8, target_loops=44)
+    b = Maze.random_maze(16, seed=9, braiding=0.8, target_loops=44)
+    assert a.wall_south == b.wall_south and a.wall_west == b.wall_west
+    print("[拓扑] OK：target_loops 精确补环、连通性保持、同种子复现")
+
+
+def test_env_randomize_topology():
+    # randomize 分支：braiding + loops 区间生效，且同 reset 种子逐墙复现
+    env = BamerEnv(randomize=True, max_steps=10, maze_braiding=0.8,
+                   maze_loops_range=(25, 50))
+    env.reset(seed=77)
+    m1 = env.scene.maze
+    assert 25 <= _loop_count(m1) <= 50 and m1.is_fully_connected()
+    env.reset(seed=77)
+    m2 = env.scene.maze
+    assert m1.wall_south == m2.wall_south and m1.wall_west == m2.wall_west
+    # 固定场景（randomize=False）不受拓扑参数影响：5×5 全开迷宫 16 环原样保留
+    fixed = task_env(maze_braiding=0.9, maze_loops_range=(30, 60))
+    fixed.reset(seed=0)
+    assert fixed.scene.maze.wall_south == empty_maze(5).wall_south
+    # 非法区间拒绝
+    for bad in ((5, 2), (-1, 10)):
+        try:
+            BamerEnv(randomize=True, maze_loops_range=bad)
+            raise AssertionError(f"maze_loops_range={bad} 未报错")
+        except ValueError:
+            pass
+    print("[拓扑] OK：env randomize 拓扑生效且可复现、固定场景不受影响、非法区间拒绝")
+
+
 if __name__ == "__main__":
     test_obs_and_spaces()
     test_rotation_step_counting()
@@ -345,4 +402,6 @@ if __name__ == "__main__":
     test_action_validation()
     test_action_space_smoke()
     test_render_rgb_array()
+    test_random_maze_target_loops()
+    test_env_randomize_topology()
     print("\nEnv 单测全部通过 [PASS]")

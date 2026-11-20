@@ -135,9 +135,72 @@ def test_eval_suite_and_reference(tmp_root="algo/runs/_test_eval"):
     print(f"[评估套件] OK：{summary.n_episodes} seeds 贪心评估 + 全知参照 = {ref} 步")
 
 
+def test_monitor_null_and_validation():
+    """monitor 关闭路径零影响 + 新配置键校验（不触发 swanlab.init，不联网）。"""
+    from algo.monitor import NullMonitor, build_monitor
+
+    cfg = TrainConfig(swanlab=False)
+    m = build_monitor(cfg)
+    assert isinstance(m, NullMonitor)
+    m.log_episode({}, step=0)
+    m.log_stage(0, "stage0")
+    m.log_eval({}, step=0)
+    m.log_summary({})
+    m.finish()                                # 全部 no-op 不抛
+    for bad in (dict(swanlab_mode="parrot"), dict(eval_mini_seeds=0),
+                dict(eval_every_options=-1)):
+        try:
+            TrainConfig(**bad).validate()
+            raise AssertionError(f"{bad} 未报错")
+        except ValueError:
+            pass
+    print("[monitor] OK：关闭路径 no-op、非法 mode/seeds 拒绝")
+
+
+def test_mini_eval_hook_and_csv_schema(tmp_root="algo/runs/_test_monitor"):
+    """mini 评估 hook：eval_every_options>0 时训练中跑 greedy 套件不崩溃；
+    episodes.csv 含 loss 分项 + Q 统计 + 探索质量诊断列。"""
+    shutil.rmtree(tmp_root, ignore_errors=True)
+    cfg = tiny_cfg(tmp_root)
+    cfg.eval_every_options = 20               # 40 option 预算 → 触发 ≥1 次 mini eval
+    summary = Trainer(cfg).run()
+    assert summary["options"] >= cfg.stage1_options
+    assert "options_per_sec" in summary
+    with open(os.path.join(tmp_root, "episodes.csv"), encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    header = list(rows[0].keys())
+    for col in ("mean_loss", "td_loss", "aux_loss", "q_mean", "q_max",
+                "move_steps", "repeat_ratio", "info_gain_per_move"):
+        assert col in header, f"episodes.csv 缺列 {col}"
+    # 诊断量语义：repeat_ratio ∈ [0,1]；info_gain_per_move ≥ 0；Q 列可解析
+    for r in rows:
+        if r["repeat_ratio"] != "":
+            assert 0.0 <= float(r["repeat_ratio"]) <= 1.0
+        if r["info_gain_per_move"] != "":
+            assert float(r["info_gain_per_move"]) >= 0.0
+        if r["q_mean"] != "":
+            assert float(r["q_mean"]) == float(r["q_mean"])   # 非 NaN
+    print("[mini评估] OK：hook 触发无异常，episodes.csv 含诊断/loss/Q 列且语义合法")
+
+
+def test_repeat_moves_unit():
+    """_repeat_moves 纯函数：已访格计数、起点不计、option 内自环不可能。"""
+    from algo.trainer import _repeat_moves
+
+    visited = {(0, 0), (1, 0)}
+    assert _repeat_moves([(2, 0), (3, 0), (1, 0)], visited) == 1     # 只有 (1,0) 已访
+    assert _repeat_moves([(0, 0), (5, 5)], visited) == 0             # 起点不计
+    assert _repeat_moves([(9, 9)], visited) == 0                     # 零位移 option
+    assert _repeat_moves([(4, 4), (0, 0), (1, 0), (2, 2)], visited) == 2  # 两格均已访
+    print("[重复探索] OK：_repeat_moves 计数语义（起点不计/已访命中）")
+
+
 if __name__ == "__main__":
     test_stage_plan()
+    test_monitor_null_and_validation()
+    test_repeat_moves_unit()
     test_end_to_end_smoke()
     test_same_seed_reproducibility()
+    test_mini_eval_hook_and_csv_schema()
     test_eval_suite_and_reference()
     print("\n训练器/评估单测全部通过 [PASS]")

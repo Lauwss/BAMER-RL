@@ -29,7 +29,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -40,6 +40,7 @@ from .actions import legal_mask
 from .agent import SMDPDQNAgent
 from .belief import BeliefState
 from .executor import Executor
+from .monitor import build_monitor
 
 # D8 里程碑（contract_v1.md §6 定稿数值）
 REWARD_FIRST_IDENTIFY = 100.0
@@ -63,6 +64,14 @@ class TrainConfig:
     lidar_n_beams: int = 180          # D4 默认；训练可降束提速（登记变更）
     lidar_max_range: float = 2.0
     maze_n: int = 16
+    # 随机迷宫拓扑（braided 赛图匹配，2026-11-20）：验收图 215 可达格 37 环、
+    # 死胡同仅 8 个（环/格 0.172），而生成器死胡同开洞上限只有 ~0.10 环/格，
+    # 故 stage1 用 braiding+补环双机制。stage0 低环练死胡同回溯与系统覆盖。
+    # None = 不补环（旧行为）。三臂须同分布，否则探索指标不可对比。
+    maze_braiding_stage0: float = 0.0
+    maze_braiding_stage1: float = 0.8
+    maze_loops_stage0: Optional[List[int]] = None   # [lo, hi] 目标环数均匀采样
+    maze_loops_stage1: Optional[List[int]] = None
     # --- 网络/智能体（§4.5 默认表） ---
     gamma: float = 0.99
     lr: float = 1e-4
@@ -79,6 +88,13 @@ class TrainConfig:
     use_traj: bool = True             # False → 14 通道消融
     use_gru: bool = False             # 本期前馈
     device: Optional[str] = None      # None = 自动
+    # --- 实验管理（可选；swanlab 云端/本地，见 algo/monitor.py） ---
+    swanlab: bool = False             # True → SwanLabMonitor 上报（未安装自动降级）
+    swanlab_project: str = "BAMER-RL"
+    swanlab_mode: str = "cloud"       # cloud / local / offline
+    # --- 训练中周期评估（mini held-out 套件，greedy 不污染训练流） ---
+    eval_every_options: int = 0       # 0 = 关闭；>0 → 每 N options 跑一次
+    eval_mini_seeds: int = 3          # mini 套件种子数（seed 派生固定，跨实验可比）
     # --- 复现与产物 ---
     seed: int = 0
     out_dir: str = "algo/runs/exp"
@@ -90,6 +106,10 @@ class TrainConfig:
             raise ValueError(f"arm 仅支持 A/B/C，得到 {self.arm!r}")
         if self.use_gru:
             raise NotImplementedError("use_gru=True 为预留升级路径，本期未实现")
+        if self.swanlab_mode not in ("cloud", "local", "offline"):
+            raise ValueError(f"swanlab_mode 仅支持 cloud/local/offline，得到 {self.swanlab_mode!r}")
+        if self.eval_every_options < 0 or self.eval_mini_seeds < 1:
+            raise ValueError("eval_every_options 须 >=0，eval_mini_seeds 须 >=1")
 
     @classmethod
     def from_yaml(cls, path: str) -> "TrainConfig":
@@ -145,6 +165,11 @@ class Trainer:
         self.stage_name = "full"
         self._stage_options_budget = 0
         self._last_ckpt_at = 0
+        # 实验管理（swanlab，可选）+ mini 评估簿记（种子由 master seed 派生，固定可比）
+        self.monitor = build_monitor(cfg)
+        self._mini_eval_seeds = [int(s) for s in np.random.default_rng(
+            int(cfg.seed) + 555).integers(0, 2 ** 31 - 1, int(cfg.eval_mini_seeds))]
+        self._last_eval_at = 0
         # 训练簿记
         self.episodes_done = 0
         self.stage_options_done = 0
@@ -155,10 +180,16 @@ class Trainer:
             json.dump(asdict(cfg), f, ensure_ascii=False, indent=1)
 
     # ---------- 环境 ----------
-    def _build_env(self, env_curriculum: Optional[str]) -> BamerEnv:
+    def _build_env(self, env_curriculum: Optional[str], stage_name: str = "stage1") -> BamerEnv:
+        # 迷宫拓扑按 stage 取参（arm C 的唯一 stage 名为 "full"，归入 stage1 档）
+        is_stage0 = stage_name == "stage0"
+        braiding = self.cfg.maze_braiding_stage0 if is_stage0 else self.cfg.maze_braiding_stage1
+        loops_range = self.cfg.maze_loops_stage0 if is_stage0 else self.cfg.maze_loops_stage1
         return BamerEnv(
             randomize=self.cfg.env_randomize, max_steps=self.cfg.env_max_steps,
             curriculum=env_curriculum,
+            maze_braiding=braiding,
+            maze_loops_range=tuple(loops_range) if loops_range is not None else None,
             lidar=LidarSpec(n_beams=self.cfg.lidar_n_beams,
                             max_range=self.cfg.lidar_max_range, noise_sigma=0.0),
         )
@@ -209,6 +240,7 @@ class Trainer:
         start_stage = 0
         if resume_from is not None:
             start_stage = self.load_checkpoint(resume_from, plan)
+            self._last_eval_at = self.agent.options_seen    # 恢复后 mini 评估从当前进度重新计时
         for si, stage in enumerate(plan):
             if si < start_stage:
                 continue
@@ -219,11 +251,14 @@ class Trainer:
             "episodes": self.episodes_done,
             "options": self.agent.options_seen,
             "learn_steps": self.agent.learn_steps,
+            "options_per_sec": round(self.agent.options_seen / max(time.time() - t0, 1e-9), 2),
             "stages": [s["name"] for s in plan],
         }
         with open(os.path.join(self.cfg.out_dir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=1)
         self._flush_logs()
+        self.monitor.log_summary(summary)
+        self.monitor.finish()
         return summary
 
     def load_checkpoint(self, path: str, plan: List[dict]) -> int:
@@ -251,7 +286,8 @@ class Trainer:
         self.reward_fn = {
             "full": self._reward_full, "search": self._reward_search,
             "entropy": self._reward_entropy}[stage["reward"]]
-        self.env = self._build_env(stage["env_curriculum"])
+        self.env = self._build_env(stage["env_curriculum"], stage["name"])
+        self.monitor.log_stage(stage_idx, stage["name"])
         self.stage_options_done = 0
         self._last_ckpt_at = self.agent.options_seen
         stage_start_options = self.agent.options_seen
@@ -268,6 +304,7 @@ class Trainer:
             episodes_this_stage += 1
             self.episodes_done += 1
             self._episode_rows.append(row)
+            self.monitor.log_episode(row, step=self.agent.options_seen)
             if self.cfg.smoke or self.episodes_done % 10 == 0:
                 self._flush_logs()
                 print(f"[{self.stage_name}] ep={self.episodes_done} seed={seed} "
@@ -277,6 +314,10 @@ class Trainer:
             if self.agent.options_seen - self._last_ckpt_at >= self.cfg.checkpoint_every_options:
                 self._last_ckpt_at = self.agent.options_seen
                 self._save_checkpoint(stage["name"])
+            if (self.cfg.eval_every_options > 0
+                    and self.agent.options_seen - self._last_eval_at >= self.cfg.eval_every_options):
+                self._last_eval_at = self.agent.options_seen
+                self._run_mini_eval()
         self._flush_logs()
         if stage_idx == 0 and len(stage_plan(self.cfg)) > 1:
             print(f"[课程切换] {stage['name']}({stage['reward']}) → stage1：buffer 清空、"
@@ -296,8 +337,14 @@ class Trainer:
         total_steps = 0
         search_steps: Optional[int] = None
         zero_step_guard = 0
-        losses: List[float] = []
+        stats_rows: List[dict] = []     # maybe_learn 返回的 {td_loss, aux_loss, total_loss}
         options_this_episode = 0
+        # 探索质量诊断量（2026-11-20）：重复探索率 + 单位移动步信息增益
+        total_slots = 2 * self.n * self.n
+        known_start = total_slots - self.belief.ledger.unknown_count()
+        move_steps = 0                  # 实际位移步（F 生效；转向/碰撞不计）
+        repeat_moves = 0                # 落入已探索格的位移步
+        q_rows: List[dict] = []         # 贪心前向的 Q 统计（ε-random 步缺失）
 
         while True:
             s = self.belief.tensor(use_traj=cfg.use_traj)
@@ -306,6 +353,11 @@ class Trainer:
             unknown_before = self.belief.ledger.unknown_count()
 
             result = self.executor.run(self.env, action)
+            # 诊断量须在 commit_option 之前取（visited 为本 option 开始前的已访集）
+            move_steps += max(len(result.path) - 1, 0)
+            repeat_moves += _repeat_moves(result.path, self.belief.visited)
+            if self.agent.last_q_stats is not None:
+                q_rows.append(self.agent.last_q_stats)
             unknown_after = self.belief.ledger.unknown_count()
 
             s2 = self.belief.tensor(use_traj=cfg.use_traj)
@@ -317,7 +369,7 @@ class Trainer:
             stats = self.agent.maybe_learn()
             self.agent.maybe_sync_target()
             if stats is not None:
-                losses.append(stats["total_loss"])
+                stats_rows.append(stats)
 
             self.belief.commit_option(result.path, result.start_cell)
             self.stage_options_done += 1
@@ -332,7 +384,7 @@ class Trainer:
                 "success": result.success, "aborted": result.aborted,
                 "terminated": result.terminated, "truncated": result.truncated,
                 "eps": round(self.agent.epsilon(), 4),
-                "loss": round(losses[-1], 5) if losses else "",
+                "loss": round(stats_rows[-1]["total_loss"], 5) if stats_rows else "",
             })
 
             if result.steps == 0:
@@ -348,6 +400,11 @@ class Trainer:
                 break
 
         n = self.n
+
+        def _mean(key: str):
+            return round(sum(s[key] for s in stats_rows) / len(stats_rows), 5) if stats_rows else ""
+
+        known_gain = (total_slots - self.belief.ledger.unknown_count()) - known_start
         return {
             "stage": self.stage_name, "episode": self.episodes_done, "seed": seed,
             "options": options_this_episode, "steps": total_steps,
@@ -356,10 +413,40 @@ class Trainer:
             "search_steps": search_steps,
             "explored_ratio": round(len(self.belief.visited) / (n * n), 4),
             "wall_knowledge": round(1.0 - unknown_after / (2 * n * n), 4),
-            "mean_loss": round(sum(losses) / len(losses), 5) if losses else "",
+            "move_steps": move_steps,
+            "repeat_ratio": round(repeat_moves / move_steps, 4) if move_steps else "",
+            "info_gain_per_move": round(known_gain / move_steps, 4) if move_steps else "",
+            "mean_loss": _mean("total_loss"),
+            "td_loss": _mean("td_loss"),
+            "aux_loss": _mean("aux_loss"),
+            "q_mean": round(sum(q["q_mean"] for q in q_rows) / len(q_rows), 3) if q_rows else "",
+            "q_max": round(max(q["q_max"] for q in q_rows), 3) if q_rows else "",
             "buffer": len(self.agent.buffer),
             "epsilon": round(self.agent.epsilon(), 4),
         }
+
+    # ---------- 训练中 mini 评估（greedy 只读，不写 buffer、不占训练种子流） ----------
+    def _mini_eval_env_factory(self) -> BamerEnv:
+        # mini 套件恒用 stage1 拓扑：跨阶段/跨臂曲线可比（held-out 语义）
+        return self._build_env(None, "stage1")
+
+    def _run_mini_eval(self) -> None:
+        from .eval import evaluate
+
+        summary = evaluate(self.agent, self._mini_eval_env_factory, self._mini_eval_seeds,
+                           self.belief, self.executor, suite="mini")
+        self.monitor.log_eval({
+            "success_rate": summary.success_rate,
+            "mean_total_steps": summary.mean_total_steps,
+            "mean_search_steps": summary.mean_search_steps,
+            "mean_options": summary.mean_options,
+            "mean_explored_ratio": summary.mean_explored_ratio,
+            "mean_wall_knowledge_ratio": summary.mean_wall_knowledge_ratio,
+        }, step=self.agent.options_seen)
+        print(f"[mini eval] options={self.agent.options_seen} "
+              f"success={summary.success_rate:.2f} "
+              f"explored={summary.mean_explored_ratio:.2%} "
+              f"steps={summary.mean_total_steps if summary.mean_total_steps is not None else '-'}")
 
     # ---------- 产物 ----------
     def _save_checkpoint(self, stage: str, final: bool = False) -> None:
@@ -404,3 +491,12 @@ class Trainer:
 
 def _count_arrived(events: List[object]) -> int:
     return sum(1 for ev in events if getattr(ev, "type", None) == "Arrived")
+
+
+def _repeat_moves(path: List[Tuple[int, int]], visited: Set[Tuple[int, int]]) -> int:
+    """重复探索步数：本 option 实际位移落入已探索格的次数（纯函数，供单测）。
+
+    path 含起点且只记真实位移（碰撞不入列）；visited 为本 option 开始前的
+    信念已访集——BFS 路径自身无环，option 内重复不存在，无需逐步更新。
+    """
+    return sum(1 for c in path[1:] if c in visited)

@@ -100,12 +100,19 @@ class BamerEnv(gymnasium.Env):
         render_mode: Optional[str] = None,
         lidar: Optional[LidarSpec] = None,
         lidar_seed: Optional[int] = None,
+        maze_braiding: float = 0.0,
+        maze_loops_range: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
         if render_mode not in (None, "rgb_array"):
             raise ValueError(f"render_mode 仅支持 None/'rgb_array'，得到 {render_mode!r}")
         if curriculum not in (None, "search"):
             raise ValueError(f"curriculum 仅支持 None/'search'，得到 {curriculum!r}")
+        if maze_loops_range is not None:
+            lo, hi = int(maze_loops_range[0]), int(maze_loops_range[1])
+            if lo < 0 or hi < lo:
+                raise ValueError(f"maze_loops_range 必须满足 0 <= lo <= hi，得到 {maze_loops_range!r}")
+            maze_loops_range = (lo, hi)
         self.curriculum = curriculum
         self._maze_fixed = maze
         self._machines_fixed = dict(state_machines) if state_machines else None
@@ -114,6 +121,9 @@ class BamerEnv(gymnasium.Env):
         self._start = tuple(start)
         self._start_heading = start_heading
         self.randomize = bool(randomize)
+        # 随机迷宫拓扑（匹配 braided 赛图；仅 randomize=True 时生效）
+        self._maze_braiding = float(maze_braiding)
+        self._maze_loops_range = maze_loops_range
         self.max_steps = int(max_steps)
         self.step_reward = float(step_reward)
         self.render_mode = render_mode
@@ -153,7 +163,12 @@ class BamerEnv(gymnasium.Env):
         scene_kwargs: Dict[str, object] = {}
         if self.randomize:
             maze_seed = int(self.np_random.integers(0, 2**31 - 1))
-            maze = Maze.random_maze(seed=maze_seed)
+            target_loops = None
+            if self._maze_loops_range is not None:
+                lo, hi = self._maze_loops_range
+                target_loops = int(self.np_random.integers(lo, hi + 1))
+            maze = Maze.random_maze(seed=maze_seed, braiding=self._maze_braiding,
+                                    target_loops=target_loops)
             dests = dict(self._destinations_fixed) if self._destinations_fixed else dict(DEFAULT_DESTINATIONS)
             names = sorted(DEFAULT_STATE_MACHINES)
             candidates = sorted(set(maze.reachable_from(self._start)) - {self._start} - set(dests.values()))
@@ -319,8 +334,13 @@ class BamerEnv(gymnasium.Env):
         return info
 
     def _scan_now(self) -> Optional[ScanResult]:
-        """当前规范位姿（格中心）的一帧全扫描；未接雷达返回 None。"""
+        """当前规范位姿（格中心）的一帧全扫描；未接雷达返回 None。
+
+        wall_query_batch = Maze.has_wall_batch：束间 DDA 完全向量化（结果与
+        标量回调路径逐位一致，见 lidar._raycast_parallel 的一致性保证）。
+        """
         if self._lidar is None:
             return None
         pose = pose_at(self._cell, HEADINGS[self._heading])
-        return self._lidar.scan(self.scene.maze.has_wall, pose)
+        return self._lidar.scan(self.scene.maze.has_wall, pose,
+                                wall_query_batch=self.scene.maze.has_wall_batch)

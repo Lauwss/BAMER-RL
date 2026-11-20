@@ -23,6 +23,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import numpy as np
 
 
+def _topology_kwargs(cfg):
+    """评估环境拓扑与训练 stage1 同分布（braiding + 补环，见 TrainConfig 注释）。
+
+    返回 kwargs 供环境工厂与场景复现共用——两处必须一致，否则评估场景与
+    全知参照场景不匹配。
+    """
+    return dict(
+        maze_braiding=cfg.maze_braiding_stage1,
+        maze_loops_range=tuple(cfg.maze_loops_stage1) if cfg.maze_loops_stage1 is not None else None,
+    )
+
+
 def build_env_factory(cfg):
     """评估用环境工厂（held-out 固定种子套件；官方图套件 env_randomize=False）。"""
     from bamer_env.env import BamerEnv
@@ -32,6 +44,7 @@ def build_env_factory(cfg):
     def factory():
         return BamerEnv(
             randomize=cfg.env_randomize, max_steps=cfg.env_max_steps,
+            **_topology_kwargs(cfg),
             lidar=LidarSpec(n_beams=cfg.lidar_n_beams,
                             max_range=cfg.lidar_max_range, noise_sigma=0.0),
         )
@@ -66,6 +79,7 @@ def run_eval(config_path: str, checkpoint: str, n_seeds: int) -> None:
     scenes = {}
     for seed in seeds:
         env = BamerEnv(randomize=cfg.env_randomize, max_steps=cfg.env_max_steps,
+                       **_topology_kwargs(cfg),
                        lidar=LidarSpec(n_beams=cfg.lidar_n_beams, max_range=cfg.lidar_max_range))
         env.reset(seed=seed)
         scenes[seed] = env.scene

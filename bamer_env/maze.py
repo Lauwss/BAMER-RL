@@ -14,6 +14,8 @@ import os
 import random
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+import numpy as np
+
 # 方向：dy/dx 与字符串方向互相对应
 DIRS = {"N": (0, 1), "S": (0, -1), "E": (1, 0), "W": (-1, 0)}
 OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
@@ -39,6 +41,9 @@ class Maze:
             self.wall_south[x][0] = True
         for y in range(n):
             self.wall_west[0][y] = True
+        # numpy 缓存（墙线不可变，构造后只读；供 has_wall_batch 向量化查询）
+        self._south_arr = np.asarray(self.wall_south, dtype=bool)   # [x, y]
+        self._west_arr = np.asarray(self.wall_west, dtype=bool)
 
     # ---------- 墙线查询（机器人感知视角的唯一合法入口） ----------
     def has_wall(self, x: int, y: int, direction: str) -> bool:
@@ -52,6 +57,37 @@ class Maze:
         if direction == "E":
             return self.wall_west[x + 1][y] if x + 1 < self.n else True
         raise ValueError(f"未知方向: {direction}")
+
+    def has_wall_batch(self, xs, ys, dirs) -> "np.ndarray":
+        """has_wall 的向量化版本（语义逐条一致，供雷达并行 DDA 批量查墙）。
+
+        xs/ys: 整型数组（须在格内）；dirs: "N"/"E"/"S"/"W" 字符数组。
+        北/东越界 = 外边框有墙（与标量版三元分支一致）。
+        """
+        xs = np.asarray(xs, dtype=np.int64)
+        ys = np.asarray(ys, dtype=np.int64)
+        out = np.ones(xs.shape, dtype=bool)
+        d = np.asarray(dirs)
+        n = self.n
+        m = d == "S"
+        if m.any():
+            out[m] = self._south_arr[xs[m], ys[m]]
+        m = d == "W"
+        if m.any():
+            out[m] = self._west_arr[xs[m], ys[m]]
+        m = d == "N"
+        if m.any():
+            x, y = xs[m], ys[m]
+            inside = y + 1 < n
+            idx_y = np.where(inside, y + 1, 0)
+            out[m] = np.where(inside, self._south_arr[x, idx_y], True)
+        m = d == "E"
+        if m.any():
+            x, y = xs[m], ys[m]
+            inside = x + 1 < n
+            idx_x = np.where(inside, x + 1, 0)
+            out[m] = np.where(inside, self._west_arr[idx_x, y], True)
+        return out
 
     def neighbors(self, x: int, y: int) -> List[Cell]:
         """从 (x,y) 出发无墙可直达的相邻格列表。"""
@@ -122,11 +158,28 @@ class Maze:
             return west[x + 1][y] if x + 1 < n else True
         raise ValueError(d)
 
+    @staticmethod
+    def _open_interior_edges(south: List[List[bool]], west: List[List[bool]], n: int) -> int:
+        """统计内部开放墙边数（每条边只数一次，不含外边框）。"""
+        count = 0
+        for x in range(n):
+            for y in range(n):
+                if y + 1 < n and not south[x][y + 1]:  # 北向开放
+                    count += 1
+                if x + 1 < n and not west[x + 1][y]:  # 东向开放
+                    count += 1
+        return count
+
     @classmethod
-    def random_maze(cls, n: int = 16, seed: Optional[int] = None, braiding: float = 0.0) -> "Maze":
+    def random_maze(cls, n: int = 16, seed: Optional[int] = None,
+                    braiding: float = 0.0, target_loops: Optional[int] = None) -> "Maze":
         """生成随机迷宫：初始四面皆墙，递归回溯挖出通道。
 
         braiding: 0~1，对死胡同额外打通一个开口的概率，形成多路径迷宫。
+        target_loops: 补环目标——先按 braiding 打通死胡同，再随机敲墙把环数
+            （回路冗余边 = 开放边数 - 格数 + 1）补到该值。敲墙在连通迷宫里
+            恒为 +1 环且不破坏连通性；用于匹配 braided 赛图的环密度
+            （官方 PPT 图 215 可达格 37 环）。None 表示不补环。
         """
         rng = random.Random(seed)
         south = [[True] * n for _ in range(n)]
@@ -177,5 +230,25 @@ class Maze:
                         for d in closed:
                             if open_between(x, y, d):
                                 break
+
+        if target_loops is not None and target_loops > 0:
+            loops = cls._open_interior_edges(south, west, n) - (n * n - 1)
+            need = target_loops - loops
+            if need > 0:
+                # 候选 = 当前封闭的内部墙（N/E 视角，每条内部墙只出现一次）
+                candidates = [
+                    (x, y, d)
+                    for x in range(n)
+                    for y in range(n)
+                    for d in ("N", "E")
+                    if (y + 1 < n if d == "N" else x + 1 < n)
+                    and cls._wall_between(south, west, n, x, y, d)
+                ]
+                rng.shuffle(candidates)
+                for x, y, d in candidates:
+                    if need <= 0:
+                        break
+                    if open_between(x, y, d):
+                        need -= 1
 
         return cls(south, west, name=f"random-{seed}")

@@ -30,3 +30,6 @@ scikit-learn==1.9.1
 tqdm==4.70.1
 pyyaml==6.0.3
 ipykernel==7.4.0
+
+# --- 实验管理（可选：algo/monitor.py；未安装自动降级不上报） ---
+swanlab==0.10.6

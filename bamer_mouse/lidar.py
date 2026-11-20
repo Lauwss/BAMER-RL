@@ -140,6 +140,67 @@ def raycast(wall_query: WallQuery, ox: float, oy: float, theta_deg: float,
     return nan, nan, nan                    # 防御分支（良性 wall_query 不会到达）
 
 
+def _raycast_parallel(wall_query: WallQuery, ox: float, oy: float,
+                      theta_degs: np.ndarray, max_range: float,
+                      wall_query_batch=None) -> np.ndarray:
+    """raycast 的束间并行版本（2026-11-20 向量化提速）。
+
+    所有束从同一起点锁步推进：每轮每束各跨一条格边界，数学全向量化；
+    墙查询优先走 wall_query_batch(xs, ys, dirs)->bool 数组（None 时退化为
+    逐束标量回调，数学仍向量化）。与标量 raycast 逐位一致的三个保证：
+      1. tie 约定同式（tx <= ty 先竖直，同一 IEEE 比较）；
+      2. 每束的查询序列不变（每轮恰查一次墙，命中/越界即退出）；
+      3. t > max_range 严格大于（恰在量程上的边界仍参与命中判定）。
+    """
+    n = theta_degs.size
+    a = np.radians(np.asarray(theta_degs, dtype=float))
+    dx = np.cos(a)
+    dy = np.sin(a)
+    ix = np.full(n, int(math.floor(ox)), dtype=np.int64)
+    iy = np.full(n, int(math.floor(oy)), dtype=np.int64)
+    ranges = np.full(n, np.nan)
+    finished = np.zeros(n, dtype=bool)
+    eps = _ON_BOUNDARY_EPS
+    pos_dx, neg_dx = dx > eps, dx < -eps
+    pos_dy, neg_dy = dy > eps, dy < -eps
+
+    for _ in range(4 * int(math.ceil(max_range)) + 8):
+        act = ~finished
+        if not act.any():
+            break
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tx = np.where(pos_dx, (ix + 1 - ox) / dx,
+                          np.where(neg_dx, (ix - ox) / dx, np.inf))
+            ty = np.where(pos_dy, (iy + 1 - oy) / dy,
+                          np.where(neg_dy, (iy - oy) / dy, np.inf))
+        vert = tx <= ty                     # 角点 tie：先竖直（确定性约定）
+        t = np.minimum(tx, ty)
+        finished |= act & (t > max_range)   # 量程外无回波（ranges 保持 NaN）
+        q = act & ~finished
+        if not q.any():
+            continue
+        dirs = np.where(vert, np.where(pos_dx, "E", "W"),
+                        np.where(pos_dy, "N", "S"))[q]
+        qx, qy = ix[q], iy[q]
+        if wall_query_batch is not None:
+            hit = np.asarray(wall_query_batch(qx, qy, dirs), dtype=bool)
+        else:
+            hit = np.fromiter((wall_query(int(x), int(y), str(d))
+                               for x, y, d in zip(qx, qy, dirs)),
+                              dtype=bool, count=qx.size)
+        hitfull = np.zeros(n, dtype=bool)
+        hitfull[np.flatnonzero(q)[hit]] = True
+        ranges[hitfull] = t[hitfull]
+        finished |= hitfull
+        adv = q & ~hitfull
+        if adv.any():
+            stepx = np.where(vert, np.where(pos_dx, 1, -1), 0)
+            stepy = np.where(~vert, np.where(pos_dy, 1, -1), 0)
+            ix += stepx * adv
+            iy += stepy * adv
+    return ranges
+
+
 def _polar_to_xy(ranges: np.ndarray, angles: np.ndarray) -> np.ndarray:
     """机体系极坐标 → 机体系笛卡尔（NaN 距离 → NaN 行）。"""
     r = np.asarray(ranges, dtype=float)
@@ -167,23 +228,24 @@ class Lidar:
         self.seed = seed
         self._rng = np.random.default_rng(seed)
 
-    def scan(self, wall_query: WallQuery, pose: Pose) -> ScanResult:
+    def scan(self, wall_query: WallQuery, pose: Pose,
+             wall_query_batch=None) -> ScanResult:
         """在位姿 pose 采一帧全扫描（机体系输出；世界系变换见 pointcloud 模块）。
 
         世界系射向 = pose.theta_deg + 机体系束角；束 0 对准 -180°（正后方），
         束 i 逆时针均布，其中恰有一束角为 0°（正前方）。
+        wall_query_batch(xs, ys, dirs)->bool 数组：可选的批量查墙入口
+        （Maze.has_wall_batch），提供时束间 DDA 完全向量化（提速 ~5×）；
+        缺省退化为逐束标量回调，结果逐位一致。
         """
         angles = self.spec.angles()
-        n = angles.shape[0]
-        ranges = np.empty(n, dtype=float)
-        for i in range(n):
-            world_theta = pose.theta_deg + angles[i]
-            r, _, _ = raycast(wall_query, pose.x, pose.y, world_theta, self.spec.max_range)
-            ranges[i] = r
+        ranges = _raycast_parallel(wall_query, pose.x, pose.y,
+                                   pose.theta_deg + angles,
+                                   self.spec.max_range, wall_query_batch)
         if self.spec.noise_sigma > 0:
             # 噪声只作用于回波距离；无论回波多少，噪声流消耗固定 n 个样本，
             # 保证同 seed 噪声序列与场景无关（可复现、可对拍）。
-            noise = self._rng.normal(0.0, self.spec.noise_sigma, size=n)
+            noise = self._rng.normal(0.0, self.spec.noise_sigma, size=angles.shape[0])
             echo = np.isfinite(ranges)
             ranges[echo] = np.clip(ranges[echo] + noise[echo], 1e-6, self.spec.max_range)
         return ScanResult(ranges=ranges, angles=angles, hit_xy=_polar_to_xy(ranges, angles))
