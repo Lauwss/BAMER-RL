@@ -88,6 +88,7 @@ class SMDPDQNAgent:
         self._act_stats_pin: Optional[torch.Tensor] = None
         self._learn_graph = None
         self._learn_loss_pin: Optional[torch.Tensor] = None
+        self._learn_graph_failed = False   # 构建失败锁存（避免每学习步重试刷屏）
         # 复现流：ε 采样 / replay 采样独立（master seed 派生，互不污染）
         self._eps_rng = np.random.default_rng(int(seed) + 1)
         self._sample_rng = np.random.default_rng(int(seed) + 2)
@@ -309,7 +310,11 @@ class SMDPDQNAgent:
             st = {k: torch.empty_like(p[k]).to(dev) for k in p}
             loss_gpu = torch.zeros(3, device=dev)
             loss_pin = torch.zeros(3, pin_memory=True)
-            params = [x for x in self.online.parameters() if x.requires_grad]
+            # 只纳入有梯度缓冲的参数：lambda_aux=0 时辅助头不参与前向（grad=None），
+            # 其梯度本就不存在，图体跳过即可（参与前向的参数在 learn#1 eager 后
+            # 必有梯度缓冲）。
+            params = [x for x in self.online.parameters()
+                      if x.requires_grad and x.grad is not None]
 
             def body() -> None:
                 for k in st:
@@ -336,6 +341,7 @@ class SMDPDQNAgent:
         except Exception as e:
             print(f"[agent] CUDA Graph(learn) 构建失败，回退 eager：{e!r}")
             self._learn_graph = None
+            self._learn_graph_failed = True
 
     def _learn_step(self, batch: dict) -> Dict[str, float]:
         dev = self.device
@@ -356,7 +362,8 @@ class SMDPDQNAgent:
             np.copyto(p["mask_a2"].numpy(), batch["mask_a2"])
             if use_graph:
                 # 首个学习步走 eager（建立 Adam 状态与稳定梯度缓冲），其后重放
-                if self._learn_graph is None and self.learn_steps >= 1:
+                if (self._learn_graph is None and self.learn_steps >= 1
+                        and not self._learn_graph_failed):
                     self._build_learn_graph()
                 if self._learn_graph is not None:
                     self._learn_graph.replay()
