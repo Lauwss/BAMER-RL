@@ -100,6 +100,14 @@ def run_eval(config_path: str, checkpoint: str, n_seeds: int) -> None:
 
 
 def main() -> None:
+    # 可选 CPU 线程限额（BAMER_TORCH_THREADS，如 3）：多进程并行训练时 torch
+    # 默认按全核开 intra-op 线程，N 进程 × 全核 → 超订阅；实测 3 并行各限 3-4
+    # 线程聚合吞吐 +25%（2026-11-21）。不设则保持 torch 默认。
+    threads = os.environ.get("BAMER_TORCH_THREADS")
+    if threads:
+        import torch
+        torch.set_num_threads(int(threads))
+
     ap = argparse.ArgumentParser(description="BAMER-RL 训练/评估入口")
     ap.add_argument("--config", required=True, help="algo/configs/*.yaml")
     ap.add_argument("--resume", default=None, help="checkpoint 路径（恢复训练）")

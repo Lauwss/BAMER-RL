@@ -36,10 +36,14 @@ GPU 同步点（10 H2D + q 统计 2×.item() + 损失 tolist），同步排队�
 
 ### 备注
 
-剩余热点为 tolist 的 GPU 队列排空等待（争抢环境下被放大）与环境侧 Python
-（update_scan/raycast/has_wall_batch ~1.9s/36.9s）；后续若再要压榨属深度优化
-（CUDA Graph/多环境向量化），当前 8× 已覆盖本地实验需求；正式网格仍建议
-服务器 run 级并行。
+干净 GPU 剖析（优化后，9.61 ms/option）：学习步（3 前向+反向+Adam）~4ms、
+环境步进（env.step python + 雷达 0.33 + 账本 0.29 + has_wall 0.11 ms/步）~3ms、
+act ~1.5ms、其余 ~0.5ms。剩余优化空间 ~30%：CUDA Graph 固化学习步/act（形状
+静态可捕获，估 −1.5~2.5ms）、环境 DDA numba/Cython 化（估 −1~1.5ms）、env.step
+python 微优化——成本递增，当前性价比不高。**并行线程限额**：torch 默认按全核开
+intra-op 线程，3 进程并行超订阅；实测每进程限 3-4 线程聚合吞吐 181 → 226
+options/s（+25%），已支持环境变量 `BAMER_TORCH_THREADS`（tools/train.py，不设
+则保持默认）。正式网格仍建议服务器 run 级并行。
 
 ## 2026-11-21 — A/C 探索塌缩根因修复：势能拉势 shaping（默认关，转正待拍板）
 
