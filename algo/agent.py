@@ -67,7 +67,10 @@ class SMDPDQNAgent:
         self.target.load_state_dict(self.online.state_dict())
         for p in self.target.parameters():
             p.requires_grad_(False)
-        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=float(lr))
+        self.n = int(n)
+        self.in_channels = int(in_channels)
+        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=float(lr),
+                                          fused=(self.device.type == "cuda"))
         # 复现流：ε 采样 / replay 采样独立（master seed 派生，互不污染）
         self._eps_rng = np.random.default_rng(int(seed) + 1)
         self._sample_rng = np.random.default_rng(int(seed) + 2)
@@ -91,6 +94,28 @@ class SMDPDQNAgent:
         self._gamma_t = torch.tensor(float(gamma), device=self.device)
         # 最近一次前向的 Q 统计（监控用，零额外成本；ε-random 步为 None）
         self.last_q_stats: Optional[Dict[str, float]] = None
+        # CUDA pinned 常驻暂存（2026-11-21 H2D 提速：pageable 逐字段 as_tensor
+        # 每次隐式同步/中转 ~1-2ms，为单 option 最大热点；改预分配 pinned 缓冲
+        # + 阻塞直拷，数据逐位一致，仅传输路径变化。CPU 设备走原路径。）
+        self._pin_cuda = (self.device.type != "cpu") and torch.cuda.is_available()
+        if self._pin_cuda:
+            bz = self.batch_size
+            pn = self.n
+            self._pin = {
+                "s":   torch.empty((bz, 16, pn, pn), dtype=torch.uint8, pin_memory=True),
+                "s2":  torch.empty((bz, 16, pn, pn), dtype=torch.uint8, pin_memory=True),
+                "gt_south": torch.empty((bz, pn, pn), dtype=torch.uint8, pin_memory=True),
+                "gt_west":  torch.empty((bz, pn, pn), dtype=torch.uint8, pin_memory=True),
+                "r":   torch.empty((bz,), dtype=torch.float32, pin_memory=True),
+                "a":   torch.empty((bz,), dtype=torch.int64, pin_memory=True),
+                "tau": torch.empty((bz,), dtype=torch.int64, pin_memory=True),
+                "terminal": torch.empty((bz,), dtype=torch.bool, pin_memory=True),
+                "mask_b":  torch.empty((bz, N_OPTIONS), dtype=torch.bool, pin_memory=True),
+                "mask_a2": torch.empty((bz, N_OPTIONS), dtype=torch.bool, pin_memory=True),
+            }
+            self._pin_act_s = torch.empty((1, self.in_channels, pn, pn), dtype=torch.uint8, pin_memory=True)
+            self._pin_act_m = torch.empty((1, N_OPTIONS), dtype=torch.bool, pin_memory=True)
+            self._legal_idx = torch.arange(N_OPTIONS, device=self.device)
 
     # ---------- ε 调度 ----------
     def epsilon(self, options_seen: Optional[int] = None) -> float:
@@ -115,6 +140,20 @@ class SMDPDQNAgent:
         self.last_q_stats = None                 # ε-random 分支无前向，不留旧值
         if not greedy and self._eps_rng.random() < eps:
             return int(legal[self._eps_rng.integers(legal.size)])
+        if self._pin_cuda:
+            # pinned 常驻暂存 + 阻塞直拷（数据一致；合法集在 GPU 端索引，免 H2D）
+            np.copyto(self._pin_act_s.numpy()[0], tensor)
+            np.copyto(self._pin_act_m.numpy()[0], mask)
+            t = self._pin_act_s.to(self.device)
+            m = self._pin_act_m.to(self.device)
+            out = self.online(t, compute_aux=False)
+            q = dueling_q(out["advantage"], out["value"], m)      # (1,259)，非法=−inf
+            q_legal = q[0, self._legal_idx[m[0]]]
+            # 单次同步取全部标量（原 3 次 .item() 各自全管线同步）
+            q_mean, q_max, a_arg = torch.stack(
+                [q_legal.mean(), q.max(), q.argmax().float()]).tolist()
+            self.last_q_stats = {"q_mean": float(q_mean), "q_max": float(q_max)}
+            return int(a_arg)
         t = torch.as_tensor(tensor, device=self.device).unsqueeze(0)
         m = torch.as_tensor(mask, device=self.device).unsqueeze(0)
         out = self.online(t, compute_aux=False)
@@ -154,14 +193,41 @@ class SMDPDQNAgent:
 
     def _learn_step(self, batch: dict) -> Dict[str, float]:
         dev = self.device
-        s = torch.as_tensor(batch["s"], device=dev)
-        s2 = torch.as_tensor(batch["s2"], device=dev)
-        a = torch.as_tensor(batch["a"], device=dev)
-        r = torch.as_tensor(batch["r"], device=dev)
-        tau = torch.as_tensor(batch["tau"], device=dev).float()
-        terminal = torch.as_tensor(batch["terminal"], device=dev)
-        mask_b = torch.as_tensor(batch["mask_b"], device=dev)
-        mask_a2 = torch.as_tensor(batch["mask_a2"], device=dev)
+        if self._pin_cuda:
+            # 批量写入 pinned 常驻暂存（CPU memcpy）→ 每字段一次阻塞 pinned H2D。
+            # 相比逐字段 pageable as_tensor：免隐式中转/同步，传输量相同、路径更短。
+            p = self._pin
+            np.copyto(p["s"].numpy(), batch["s"])
+            np.copyto(p["s2"].numpy(), batch["s2"])
+            np.copyto(p["gt_south"].numpy(), batch["gt_south"])
+            np.copyto(p["gt_west"].numpy(), batch["gt_west"])
+            np.copyto(p["r"].numpy(), batch["r"])
+            np.copyto(p["a"].numpy(), batch["a"])
+            np.copyto(p["tau"].numpy(), batch["tau"])
+            np.copyto(p["terminal"].numpy(), batch["terminal"])
+            np.copyto(p["mask_b"].numpy(), batch["mask_b"])
+            np.copyto(p["mask_a2"].numpy(), batch["mask_a2"])
+            s = p["s"].to(dev)
+            s2 = p["s2"].to(dev)
+            a = p["a"].to(dev)
+            r = p["r"].to(dev)
+            tau = p["tau"].to(dev).float()
+            terminal = p["terminal"].to(dev)
+            mask_b = p["mask_b"].to(dev)
+            mask_a2 = p["mask_a2"].to(dev)
+            gt_s = p["gt_south"].to(dev)
+            gt_w = p["gt_west"].to(dev)
+        else:
+            s = torch.as_tensor(batch["s"], device=dev)
+            s2 = torch.as_tensor(batch["s2"], device=dev)
+            a = torch.as_tensor(batch["a"], device=dev)
+            r = torch.as_tensor(batch["r"], device=dev)
+            tau = torch.as_tensor(batch["tau"], device=dev).float()
+            terminal = torch.as_tensor(batch["terminal"], device=dev)
+            mask_b = torch.as_tensor(batch["mask_b"], device=dev)
+            mask_a2 = torch.as_tensor(batch["mask_a2"], device=dev)
+            gt_s = torch.as_tensor(batch["gt_south"], device=dev)
+            gt_w = torch.as_tensor(batch["gt_west"], device=dev)
 
         # TD：Q_online(s, a) vs Double-DQN target
         out = self.online(s, compute_aux=self.lambda_aux > 0)
@@ -188,8 +254,7 @@ class SMDPDQNAgent:
         if self.lambda_aux > 0 and "aux_logits" in out:
             aux_logits = out["aux_logits"]                        # (B,4,n,n)
             unknown = (s[:, :4] == 0)                             # (B,4,n,n) 逐方向未知掩码
-            gt = gt_directional_walls(torch.as_tensor(batch["gt_south"], device=dev),
-                                      torch.as_tensor(batch["gt_west"], device=dev))
+            gt = gt_directional_walls(gt_s, gt_w)                 # 已随批量一并上 GPU
             bce_all = nn.functional.binary_cross_entropy_with_logits(
                 aux_logits, gt, reduction="none")
             bce_t = (bce_all * unknown).sum() / unknown.sum().clamp(min=1)

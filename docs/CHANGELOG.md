@@ -2,6 +2,42 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-21 — 学习/决策路径 H2D 提速：pinned 常驻暂存 + 同步合并（agent.py，吞吐 8×）
+
+### 热点定位（cProfile + 分相微基准，500-option 短跑）
+
+`torch.as_tensor(numpy, device=cuda)` 逐字段上传占 46%（学习步 10 字段 10.7ms/
+次 + act 3 次，pageable 内存每次隐式中转/同步 1–2ms）；叠加每 option ~13 个
+GPU 同步点（10 H2D + q 统计 2×.item() + 损失 tolist），同步排队构成第一瓶颈
+（GPU 纯算仅 ~6%）。注意：剖析期间本机 GPU 同时被外部图形进程占用，绝对值
+被放大，但前后同条件对比有效。
+
+### 改动（`algo/agent.py`，数值与语义不变）
+
+1. **pinned 常驻暂存**：`__init__` 预分配 batch 级 pinned 缓冲（s/s2/gt×2/r/a/
+   tau/terminal/mask×2）与 act 级暂存（按 in_channels）；学习步先 CPU memcpy
+   写入 pinned，再每字段一次阻塞 pinned H2D（免 pageable 中转）；
+2. **act 合法集 GPU 端索引**：mask 上传后 `legal_idx[gpu_mask]` 在 GPU 上取
+   合法集，免第三次小 H2D；
+3. **单次同步**：act 的 q_mean/q_max/argmax 合并为一次 `torch.stack().tolist()`
+  （原 3 次 `.item()` 各自全管线同步）；学习步损失上报合并保持不变；
+4. **Adam fused=True**（仅 CUDA）：优化器步合并进单 kernel。
+
+### 实测（同条件前后对比：外部 GPU 占用状态一致）
+
+- 学习步 H2D 微基准：10.68 → **0.46 ms**（23×）；
+- 边际吞吐（2500-option 同口径）：70.3 → **8.8 ms/option（14.2 → 114 options/s，
+  8×）**；全套测试 33 → 25 s；
+- 数值一致性：同种子复现测试逐行一致通过（14/14），shaping 测试 episode 奖励
+  与改前逐位相同（fused Adam 未翻转任何决策）；算法语义零变化。
+
+### 备注
+
+剩余热点为 tolist 的 GPU 队列排空等待（争抢环境下被放大）与环境侧 Python
+（update_scan/raycast/has_wall_batch ~1.9s/36.9s）；后续若再要压榨属深度优化
+（CUDA Graph/多环境向量化），当前 8× 已覆盖本地实验需求；正式网格仍建议
+服务器 run 级并行。
+
 ## 2026-11-21 — A/C 探索塌缩根因修复：势能拉势 shaping（默认关，转正待拍板）
 
 完整分析过程见 **docs/ac_collapse_analysis.md**。要点：
