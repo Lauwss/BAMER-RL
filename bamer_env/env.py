@@ -121,7 +121,8 @@ class BamerEnv(gymnasium.Env):
         self._start = tuple(start)
         self._start_heading = start_heading
         self.randomize = bool(randomize)
-        # 随机迷宫拓扑（匹配 braided 赛图；仅 randomize=True 时生效）
+        # 随机迷宫拓扑（匹配 braided 赛图；仅 randomize=True 且未给固定 maze 时生效；
+        # 给了 maze= 则拓扑钉死、仍随机布点）
         self._maze_braiding = float(maze_braiding)
         self._maze_loops_range = maze_loops_range
         self.max_steps = int(max_steps)
@@ -162,13 +163,18 @@ class BamerEnv(gymnasium.Env):
         # 场景来源优先级：reset options 注入（R2 代码冻结接口） > randomize > 构造参数/默认
         scene_kwargs: Dict[str, object] = {}
         if self.randomize:
-            maze_seed = int(self.np_random.integers(0, 2**31 - 1))
-            target_loops = None
-            if self._maze_loops_range is not None:
-                lo, hi = self._maze_loops_range
-                target_loops = int(self.np_random.integers(lo, hi + 1))
-            maze = Maze.random_maze(seed=maze_seed, braiding=self._maze_braiding,
-                                    target_loops=target_loops)
+            if self._maze_fixed is not None:
+                # 固定迷宫 + 随机布点（2026-11-21 诊断实验）：拓扑钉死（构造参数
+                # maze=），机器布点每集重摆，终点沿用固定/默认位置。
+                maze = self._maze_fixed
+            else:
+                maze_seed = int(self.np_random.integers(0, 2**31 - 1))
+                target_loops = None
+                if self._maze_loops_range is not None:
+                    lo, hi = self._maze_loops_range
+                    target_loops = int(self.np_random.integers(lo, hi + 1))
+                maze = Maze.random_maze(seed=maze_seed, braiding=self._maze_braiding,
+                                        target_loops=target_loops)
             dests = dict(self._destinations_fixed) if self._destinations_fixed else dict(DEFAULT_DESTINATIONS)
             names = sorted(DEFAULT_STATE_MACHINES)
             candidates = sorted(set(maze.reachable_from(self._start)) - {self._start} - set(dests.values()))

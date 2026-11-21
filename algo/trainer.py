@@ -73,6 +73,17 @@ class TrainConfig:
     maze_braiding_stage1: float = 0.8
     maze_loops_stage0: Optional[List[int]] = None   # [lo, hi] 目标环数均匀采样
     maze_loops_stage1: Optional[List[int]] = None
+    # 固定迷宫诊断（2026-11-21，GPT 评审"固定环境 A/B"）：None = 每集随机迷宫
+    # （现行）。"generated" = 固定一张随机生成的 braiding-stage1 迷宫（seed 派生，
+    # 补环至官方密度 37）；"official" = 固定官方 PPT 赛图（Maze.default()）。
+    # 两 stage 共用同一张（课程只剩奖励切换）；机器布点每集随机、终点沿用固定
+    # 默认位置；braiding/loops 参数仅用于生成该固定实例。
+    maze_fixed: Optional[str] = None
+    # frontier 引导（2026-11-21，探索塌缩修复§改动1）：legal_mask 的 Explore
+    # 目标收窄为信念前沿格（扫描后信息量必严格增加的格子）。零信息目标被排除
+    # 出候选集 → 贪心微步环结构性消除；ε 采样池同步收窄（与§改动2合并实现，
+    # 两者在掩码实现下等价）。frontier 为空（可达区域完全观测）回退全可达集。
+    frontier_mask: bool = False
     # --- 网络/智能体（§4.5 默认表） ---
     gamma: float = 0.99
     lr: float = 1e-4
@@ -123,6 +134,8 @@ class TrainConfig:
             raise ValueError("eval_every_options 须 >=0，eval_mini_seeds 须 >=1")
         if self.shape_potential and self.shape_scale <= 0:
             raise ValueError(f"shape_potential=True 时 shape_scale 须 >0，得到 {self.shape_scale!r}")
+        if self.maze_fixed not in (None, "official", "generated"):
+            raise ValueError(f"maze_fixed 仅支持 None/'official'/'generated'，得到 {self.maze_fixed!r}")
 
     @classmethod
     def from_yaml(cls, path: str) -> "TrainConfig":
@@ -132,6 +145,23 @@ class TrainConfig:
         cfg = cls(**data)
         cfg.validate()
         return cfg
+
+
+# 固定迷宫补环目标 = 官方赛图可达格环密度（215 可达格 37 环，2026-11-20 普查）
+FIXED_MAZE_TARGET_LOOPS = 37
+
+
+def build_fixed_maze(cfg: "TrainConfig"):
+    """按 maze_fixed 配置构建固定迷宫实例（两 stage/评估共用，只建一次）。"""
+    from bamer_env.maze import Maze
+    if cfg.maze_fixed == "official":
+        return Maze.default()
+    if cfg.maze_fixed == "generated":
+        # seed 取 master seed 派生值（避开 +100 环境流/+555 评估流）；环密度对齐官方
+        return Maze.random_maze(n=cfg.maze_n, seed=int(cfg.seed) + 200,
+                                braiding=cfg.maze_braiding_stage1,
+                                target_loops=FIXED_MAZE_TARGET_LOOPS)
+    raise ValueError(f"maze_fixed 非法: {cfg.maze_fixed!r}")
 
 
 def stage_plan(cfg: TrainConfig) -> List[dict]:
@@ -174,6 +204,7 @@ class Trainer:
         self.belief = BeliefState(n=self.n, max_range=cfg.lidar_max_range)
         self.executor = Executor(self.belief, max_option_steps=cfg.env_max_steps)
         self.env: Optional[BamerEnv] = None
+        self._fixed_maze = None    # maze_fixed 时的共享迷宫实例（懒构建）
         self.reward_fn: Callable = self._reward_full
         self.stage_name = "full"
         self._stage_options_budget = 0
@@ -194,11 +225,18 @@ class Trainer:
 
     # ---------- 环境 ----------
     def _build_env(self, env_curriculum: Optional[str], stage_name: str = "stage1") -> BamerEnv:
-        # 迷宫拓扑按 stage 取参（arm C 的唯一 stage 名为 "full"，归入 stage1 档）
+        # 迷宫拓扑按 stage 取参（arm C 的唯一 stage 名为 "full"，归入 stage1 档）；
+        # maze_fixed 时两 stage 共用同一张固定实例（课程只剩奖励切换）
         is_stage0 = stage_name == "stage0"
         braiding = self.cfg.maze_braiding_stage0 if is_stage0 else self.cfg.maze_braiding_stage1
         loops_range = self.cfg.maze_loops_stage0 if is_stage0 else self.cfg.maze_loops_stage1
+        fixed_maze = None
+        if self.cfg.maze_fixed is not None:
+            if self._fixed_maze is None:
+                self._fixed_maze = build_fixed_maze(self.cfg)
+            fixed_maze = self._fixed_maze
         return BamerEnv(
+            maze=fixed_maze,
             randomize=self.cfg.env_randomize, max_steps=self.cfg.env_max_steps,
             curriculum=env_curriculum,
             maze_braiding=braiding,
@@ -294,7 +332,7 @@ class Trainer:
         import torch
         ckpt = torch.load(path, weights_only=False)
         saved_cfg = ckpt["cfg"]
-        for key in ("arm", "stage0_options", "stage1_options", "seed", "maze_n"):
+        for key in ("arm", "stage0_options", "stage1_options", "seed", "maze_n", "maze_fixed"):
             if saved_cfg.get(key) != getattr(self.cfg, key):
                 raise ValueError(f"checkpoint 配置不匹配: {key} "
                                  f"(ckpt={saved_cfg.get(key)}, cfg={getattr(self.cfg, key)})")
@@ -376,7 +414,7 @@ class Trainer:
 
         while True:
             s = self.belief.tensor(use_traj=cfg.use_traj)
-            mask = legal_mask(self.belief)
+            mask = legal_mask(self.belief, frontier_only=cfg.frontier_mask)
             action = self.agent.act(s, mask)
             unknown_before = self.belief.ledger.unknown_count()
             # 本 option 开始前的已访快照：executor 执行期间每步 observe 都会把
@@ -391,7 +429,7 @@ class Trainer:
             unknown_after = self.belief.ledger.unknown_count()
 
             s2 = self.belief.tensor(use_traj=cfg.use_traj)
-            mask2 = legal_mask(self.belief)
+            mask2 = legal_mask(self.belief, frontier_only=cfg.frontier_mask)
             reward = self.reward_fn(result, unknown_before, unknown_after)
             if cfg.shape_potential:
                 reward = self._shape_reward(reward, unknown_before, unknown_after,
@@ -467,7 +505,8 @@ class Trainer:
         from .eval import evaluate
 
         summary = evaluate(self.agent, self._mini_eval_env_factory, self._mini_eval_seeds,
-                           self.belief, self.executor, suite="mini")
+                           self.belief, self.executor, suite="mini",
+                           frontier_only=self.cfg.frontier_mask)
         self.monitor.log_eval({
             "success_rate": summary.success_rate,
             "mean_total_steps": summary.mean_total_steps,

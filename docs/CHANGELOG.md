@@ -2,6 +2,65 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-21 — frontier 引导（legal_mask 的 Explore 目标收窄为信念前沿格）
+
+诊断背景：固定迷宫 A/B 实验（下节）证伪"任务太难"假设——贪心死循环在确定性
+环境中更强（fixgen 15 格环 0 送达、fixppt 4 格环）。机制归因：零信息动作的
+shaped 回报 −τ+scale·Φ(γ^τ−1) 是 τ 的严格递减函数 → 贪心在零信息近目标内
+排序必选最小 τ → 微步环是奖励结构下的真实局部最优；frontier 格的价值只能经
+跨 option 自举传播，所需转移样本稀疏且高方差，自举值收敛悲观。
+
+### 改动（`algo/actions.py`、`TrainConfig.frontier_mask: bool = False` 门控默认关）
+
+1. `frontier_cells(belief)`：可达 且 邻接 ≥1 unknown 墙槽的格子（扫描后信息量
+   必严格增加）。几何性质：unknown 槽两侧格子必未被射线照亮 → 任一 unknown 槽
+   旁必有"已照亮未扫描"可达格 → **frontier 为空 ⟺ 可达区域完全观测**；
+2. `legal_mask(frontier_only=True)`：Explore 候选收窄为前沿格；frontier 为空
+   （完全观测）回退全可达集；Pick/Deliver 语义不变。ε 采样池同步收窄（ε 从
+   mask 均匀采样，§改动2 与掩码实现等价，合并实现）；
+3. 训练（mask/mask2）、mini eval、held-out 评估全链路同语义接线
+   （`evaluate(..., frontier_only=)`），默认 False 时行为逐位不变。
+
+### 单测（tests/test_frontier.py，全量 16/16 过）
+
+前沿格语义（可达子集/unknown 邻接/当前格排除）、掩码收窄精确匹配（Explore
+子集=frontier 索引集、任务位不变）、完全观测回退等价、端到端 20 option 全程
+合法非空。死胡同处理论证：死胡同格扫描后四槽全揭示 → 自动退出候选集，BFS
+折返即回溯路径，无需专门机制。
+
+### 实验（进行中，seed 0 × 160k，A 臂同栈）
+
+fixgen_frontier（温室，对照 fixgen 0 送达/15 格环）+ random_frontier（对照
+aux05 送达 20.6%/成功 2.6%）。冒烟积极信号：random 冒烟 ep2 即 search_complete
+（146 步，基线发生率 0-1.3%）。
+
+## 2026-11-21 — 固定迷宫诊断 A/B（maze_fixed 门控 + fixgen/fixppt 两臂结果）
+
+用户假设"任务太难导致 stage1 难成功"，执行 GPT 评审采纳项"固定环境 A/B"。
+
+### 改动（`maze_fixed: None/"official"/"generated"`，bamer_env/env.py + algo/trainer.py）
+
+固定迷宫 + 随机布点：迷宫钉死一张、机器布点每集随机、终点沿用固定默认位置
+(7,7)/(8,8)；两 stage 共用同一实例（课程只剩奖励切换）。generated = braiding
+0.8 + 补环 37（官方密度）、seed=cfg.seed+200；official = Maze.default()。
+env.reset 的 randomize 分支在给定 maze= 时复用固定实例（未给时行为不变）。
+评估工厂/checkpoint 校验同步接线。单测 tests/test_fixed_maze.py（全量 16/16 过）。
+
+### 结果（A 臂同栈 seed 0 × 160k；对照 armA_g0999_aux05）
+
+| | baseline 随机迷宫 | fixgen 固定生成图 | fixppt 固定官方图 |
+|---|---|---|---|
+| stage1 训练期 ≥1 送达 | 20.6% | **0/426 = 0%** | 23.4% |
+| stage1 训练期成功率 | 2.6% (16/611) | **0%** | 3.4% (18/531) |
+| 30-seed greedy 成功率 | 0/30 | 0/30 | 0/30 |
+| 30-seed greedy 探索覆盖 | 8.7% | 5.7%（15 格环） | **1.6%（4 格环）** |
+
+**结论**：固定迷宫不提升反恶化——确定性输入使 Q 排序跨集定型，贪心锁死单一
+巡逻环（fixgen 环不过终点格 → 0 送达；rollout 实测 ImageFeed=0）。随机迷宫的
+"较好表现"是每集墙变打破环路径 + ε 偶发命中任务点的掩蔽效应。**主要矛盾 =
+无 ε 时探索塌缩，"任务太难"假设不成立**（greedy rollout 事件流诊断，8/8 seed
+复现）。机制详见 memory bamer-fixed-maze-experiment。
+
 ## 2026-11-21 — λ_aux=0 消融（seed 0，shaping+γ=0.999+Graph 基线上单变量）
 
 用户提出"辅助损失似乎没什么用"。设计：shaping+γ=0.999+Graph 基线上仅去

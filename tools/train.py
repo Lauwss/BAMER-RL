@@ -27,9 +27,12 @@ def _topology_kwargs(cfg):
     """评估环境拓扑与训练 stage1 同分布（braiding + 补环，见 TrainConfig 注释）。
 
     返回 kwargs 供环境工厂与场景复现共用——两处必须一致，否则评估场景与
-    全知参照场景不匹配。
+    全知参照场景不匹配。maze_fixed 时返回固定实例（与训练共享同一张）。
     """
+    from algo.trainer import build_fixed_maze
+
     return dict(
+        maze=build_fixed_maze(cfg) if cfg.maze_fixed is not None else None,
         maze_braiding=cfg.maze_braiding_stage1,
         maze_loops_range=tuple(cfg.maze_loops_stage1) if cfg.maze_loops_stage1 is not None else None,
     )
@@ -71,7 +74,8 @@ def run_eval(config_path: str, checkpoint: str, n_seeds: int) -> None:
     seeds = [int(s) for s in np.random.default_rng(cfg.seed + 777).integers(0, 2**31 - 1, n_seeds)]
     belief = BeliefState(n=cfg.maze_n, max_range=cfg.lidar_max_range)
     executor = Executor(belief, max_option_steps=cfg.env_max_steps)
-    summary = evaluate(agent, build_env_factory(cfg), seeds, belief, executor, suite="held-out")
+    summary = evaluate(agent, build_env_factory(cfg), seeds, belief, executor, suite="held-out",
+                       frontier_only=cfg.frontier_mask)
 
     # 逐 seed 场景复现（参照计算需要布点 GT：评估侧特权）
     from bamer_env.env import BamerEnv

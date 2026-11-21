@@ -23,7 +23,8 @@ from typing import Optional, Set, Tuple
 
 import numpy as np
 
-from .belief import (BeliefState, DEST_NAMES, HEADINGS, MACHINE_NAMES)  # noqa: F401 (re-export)
+from .belief import (BeliefState, DEST_NAMES, HEADINGS, MACHINE_NAMES,  # noqa: F401 (re-export)
+                     W_UNKNOWN)
 
 Cell = Tuple[int, int]
 
@@ -80,10 +81,31 @@ def reachable_cells(belief: BeliefState, start: Cell) -> Set[Cell]:
     return seen
 
 
-def legal_mask(belief: BeliefState) -> np.ndarray:
+def frontier_cells(belief: BeliefState) -> Set[Cell]:
+    """信念前沿格：可达且至少一个邻接墙槽未观测（站上扫描后信息量必严格增加）。
+
+    几何性质（2026-11-21 诊断实验论证）：unknown 槽两侧格子必然从未被任何射线
+    照亮，故任一 unknown 槽旁必存在"已照亮未扫描"的可达格 → frontier 为空
+    ⟺ 可达区域完全观测（此时剩余 unknown 区域与可达部分真实隔离）。
+    """
+    fron: Set[Cell] = set()
+    ledger = belief.ledger
+    for (x, y) in reachable_cells(belief, belief.cell):
+        for d in ("S", "W", "N", "E"):
+            if ledger.wall_value(x, y, d) == W_UNKNOWN:
+                fron.add((x, y))
+                break
+    return fron
+
+
+def legal_mask(belief: BeliefState, frontier_only: bool = False) -> np.ndarray:
     """当前信念下的合法选项掩码 (259,) bool。
 
     调用时机 = 决策边界（belief 已消费到当前步的 obs/info）。
+    frontier_only=True（2026-11-21 探索塌缩修复，§改动1）：Explore 目标收窄为
+    信念前沿格——零信息目标被排除出候选集，消除贪心微步环；Explore 执行必然
+    揭示 ≥1 未知墙槽，与势能 shaping 的增量语义一致。frontier 为空（可达区域
+    完全观测）时回退全可达集。
     合法集保证非空：机器鼠来路边界必然已探明无墙（每个到访格的入射开放
     边界由扫描揭示），Explore 回溯目标恒存在。
     """
@@ -91,6 +113,11 @@ def legal_mask(belief: BeliefState) -> np.ndarray:
     mask = np.zeros(N_OPTIONS, dtype=bool)
     reach = reachable_cells(belief, belief.cell)
     reach.discard(belief.cell)                      # 排除 τ=0 空转目标
+    if frontier_only:
+        fron = frontier_cells(belief)
+        fron.discard(belief.cell)
+        if fron:                                    # 空 = 可达区域完全观测 → 回退
+            reach = fron
     for cell in reach:
         mask[explore_index(cell, n)] = True
     if belief.carrying is None:
