@@ -58,10 +58,18 @@ class SMDPDQNAgent:
                  grad_clip: float = 10.0, eps_start: float = 0.10, eps_end: float = 0.02,
                  eps_anneal_options: int = 20000, capacity: int = 100_000,
                  n: int = 16, aux_head: bool = True, use_gru: bool = False,
-                 device: Optional[str] = None, seed: int = 0):
+                 device: Optional[str] = None, seed: int = 0,
+                 use_cuda_graph: bool = False):
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(int(seed))
+        if self.device.type == "cuda":
+            # cuDNN 确定算法（2026-11-21）：默认 False 时 conv 反传选非确定核，
+            # 同 seed 两次运行参数有 ~1e-8 级漂移（轨迹靠 argmax 鲁棒性才一致）；
+            # 显式开启后 CUDA Graph 与 eager 逐位一致、复现从"轨迹级"升为"参数级"。
+            # 小网络实测无显著速度代价。
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
         self.online = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru).to(self.device)
         self.target = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
@@ -71,6 +79,15 @@ class SMDPDQNAgent:
         self.in_channels = int(in_channels)
         self.optimizer = torch.optim.Adam(self.online.parameters(), lr=float(lr),
                                           fused=(self.device.type == "cuda"))
+        # CUDA Graph（2026-11-21，纯性能开关默认关）：act/学习体内核序列固化，
+        # 轨迹与 eager 逐位一致（同 kernel 同序；warmup 无优化器副作用；
+        # clip/Adam.step 留在图外 → Adam 状态创建与 lr 变更保持原语义）。
+        # 构建失败自动回退 eager，不阻断训练。
+        self.use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
+        self._act_graph = None
+        self._act_stats_pin: Optional[torch.Tensor] = None
+        self._learn_graph = None
+        self._learn_loss_pin: Optional[torch.Tensor] = None
         # 复现流：ε 采样 / replay 采样独立（master seed 派生，互不污染）
         self._eps_rng = np.random.default_rng(int(seed) + 1)
         self._sample_rng = np.random.default_rng(int(seed) + 2)
@@ -144,6 +161,15 @@ class SMDPDQNAgent:
             # pinned 常驻暂存 + 阻塞直拷（数据一致；合法集在 GPU 端索引，免 H2D）
             np.copyto(self._pin_act_s.numpy()[0], tensor)
             np.copyto(self._pin_act_m.numpy()[0], mask)
+            if self.use_cuda_graph:
+                if self._act_graph is None:
+                    self._build_act_graph()
+                if self._act_graph is not None:
+                    self._act_graph.replay()
+                    torch.cuda.current_stream().synchronize()
+                    st = self._act_stats_pin.tolist()
+                    self.last_q_stats = {"q_mean": float(st[0]), "q_max": float(st[1])}
+                    return int(st[2])
             t = self._pin_act_s.to(self.device)
             m = self._pin_act_m.to(self.device)
             out = self.online(t, compute_aux=False)
@@ -191,43 +217,11 @@ class SMDPDQNAgent:
         self.target.load_state_dict(self.online.state_dict())
         self._last_target_sync = self.options_seen
 
-    def _learn_step(self, batch: dict) -> Dict[str, float]:
-        dev = self.device
-        if self._pin_cuda:
-            # 批量写入 pinned 常驻暂存（CPU memcpy）→ 每字段一次阻塞 pinned H2D。
-            # 相比逐字段 pageable as_tensor：免隐式中转/同步，传输量相同、路径更短。
-            p = self._pin
-            np.copyto(p["s"].numpy(), batch["s"])
-            np.copyto(p["s2"].numpy(), batch["s2"])
-            np.copyto(p["gt_south"].numpy(), batch["gt_south"])
-            np.copyto(p["gt_west"].numpy(), batch["gt_west"])
-            np.copyto(p["r"].numpy(), batch["r"])
-            np.copyto(p["a"].numpy(), batch["a"])
-            np.copyto(p["tau"].numpy(), batch["tau"])
-            np.copyto(p["terminal"].numpy(), batch["terminal"])
-            np.copyto(p["mask_b"].numpy(), batch["mask_b"])
-            np.copyto(p["mask_a2"].numpy(), batch["mask_a2"])
-            s = p["s"].to(dev)
-            s2 = p["s2"].to(dev)
-            a = p["a"].to(dev)
-            r = p["r"].to(dev)
-            tau = p["tau"].to(dev).float()
-            terminal = p["terminal"].to(dev)
-            mask_b = p["mask_b"].to(dev)
-            mask_a2 = p["mask_a2"].to(dev)
-            gt_s = p["gt_south"].to(dev)
-            gt_w = p["gt_west"].to(dev)
-        else:
-            s = torch.as_tensor(batch["s"], device=dev)
-            s2 = torch.as_tensor(batch["s2"], device=dev)
-            a = torch.as_tensor(batch["a"], device=dev)
-            r = torch.as_tensor(batch["r"], device=dev)
-            tau = torch.as_tensor(batch["tau"], device=dev).float()
-            terminal = torch.as_tensor(batch["terminal"], device=dev)
-            mask_b = torch.as_tensor(batch["mask_b"], device=dev)
-            mask_a2 = torch.as_tensor(batch["mask_a2"], device=dev)
-            gt_s = torch.as_tensor(batch["gt_south"], device=dev)
-            gt_w = torch.as_tensor(batch["gt_west"], device=dev)
+    def _learn_body(self, t: Dict[str, torch.Tensor]):
+        """学习体公共计算（eager 与 CUDA Graph 共用）：GPU 张量 dict → 三损失。"""
+        s, s2, a, r = t["s"], t["s2"], t["a"], t["r"]
+        tau = t["tau"].float()
+        terminal, mask_b, mask_a2 = t["terminal"], t["mask_b"], t["mask_a2"]
 
         # TD：Q_online(s, a) vs Double-DQN target
         out = self.online(s, compute_aux=self.lambda_aux > 0)
@@ -254,13 +248,132 @@ class SMDPDQNAgent:
         if self.lambda_aux > 0 and "aux_logits" in out:
             aux_logits = out["aux_logits"]                        # (B,4,n,n)
             unknown = (s[:, :4] == 0)                             # (B,4,n,n) 逐方向未知掩码
-            gt = gt_directional_walls(gt_s, gt_w)                 # 已随批量一并上 GPU
+            gt = gt_directional_walls(t["gt_south"], t["gt_west"])  # 已随批量一并上 GPU
             bce_all = nn.functional.binary_cross_entropy_with_logits(
                 aux_logits, gt, reduction="none")
             bce_t = (bce_all * unknown).sum() / unknown.sum().clamp(min=1)
             loss = td_loss + self.lambda_aux * bce_t
+        return td_loss, bce_t, loss
 
-        self.optimizer.zero_grad(set_to_none=True)
+    def _build_act_graph(self) -> None:
+        """捕获 act 推理体（H2D→前向→dueling→统计→D2H）。
+
+        动态合法集 gather 改写为等价固定形状：argmax 全向量（非法=−inf，结果
+        相同）+ 掩码均值 where(m,q,0).sum()/m.sum()（仅监控量，~1ulp 序差可接受）。
+        warmup 仅前向（无 RNG/无状态），参数后续原地更新 → 图始终反映最新权重。
+        """
+        try:
+            dev = self.device
+            s_stat = torch.empty_like(self._pin_act_s).to(dev)
+            m_stat = torch.empty_like(self._pin_act_m).to(dev)
+            stats_gpu = torch.zeros(3, device=dev)
+            stats_pin = torch.zeros(3, pin_memory=True)
+
+            def body() -> None:
+                with torch.no_grad():
+                    out = self.online(s_stat, compute_aux=False)
+                    q = dueling_q(out["advantage"], out["value"], m_stat)
+                    q_mean = torch.where(m_stat, q, torch.zeros_like(q)).sum() \
+                        / m_stat.sum().clamp(min=1)
+                    stats = torch.stack([q_mean, q.max(), q.argmax().float()])
+                stats_gpu.copy_(stats)
+                stats_pin.copy_(stats_gpu, non_blocking=True)
+
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):                                # 预热：分配/内核就绪
+                    s_stat.copy_(self._pin_act_s, non_blocking=True)
+                    m_stat.copy_(self._pin_act_m, non_blocking=True)
+                    body()
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                s_stat.copy_(self._pin_act_s, non_blocking=True)
+                m_stat.copy_(self._pin_act_m, non_blocking=True)
+                body()
+            self._act_graph = g
+            self._act_stats_pin = stats_pin
+        except Exception as e:
+            print(f"[agent] CUDA Graph(act) 构建失败，回退 eager：{e!r}")
+            self._act_graph = None
+
+    def _build_learn_graph(self) -> None:
+        """捕获学习体（H2D→3 前向→损失→反向）。clip/Adam.step 留在图外：
+        fused Adam eager 读静态梯度缓冲，Adam 状态首次创建与 lr 变更均保持
+        原语义，无需因 set_lr 重捕获。warmup 只跑前向+反向（无 step），参数与
+        Adam 状态零污染 → 轨迹与 eager 逐位一致。"""
+        try:
+            dev = self.device
+            p = self._pin
+            st = {k: torch.empty_like(p[k]).to(dev) for k in p}
+            loss_gpu = torch.zeros(3, device=dev)
+            loss_pin = torch.zeros(3, pin_memory=True)
+            params = [x for x in self.online.parameters() if x.requires_grad]
+
+            def body() -> None:
+                for k in st:
+                    st[k].copy_(p[k], non_blocking=True)
+                for x in params:
+                    x.grad.zero_()                                # 梯度缓冲静态化
+                td, bce, total = self._learn_body(st)
+                total.backward()                                  # 反传也在图内
+                loss_gpu.copy_(torch.stack([td.detach(), bce.detach(),
+                                            total.detach()]))
+                loss_pin.copy_(loss_gpu, non_blocking=True)
+
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):                                # 预热：无 step 副作用
+                    body()
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                body()
+            self._learn_graph = g
+            self._learn_loss_pin = loss_pin
+        except Exception as e:
+            print(f"[agent] CUDA Graph(learn) 构建失败，回退 eager：{e!r}")
+            self._learn_graph = None
+
+    def _learn_step(self, batch: dict) -> Dict[str, float]:
+        dev = self.device
+        use_graph = self.use_cuda_graph and self._pin_cuda
+        if self._pin_cuda:
+            # 批量写入 pinned 常驻暂存（CPU memcpy）→ 每字段一次阻塞 pinned H2D。
+            # 相比逐字段 pageable as_tensor：免隐式中转/同步，传输量相同、路径更短。
+            p = self._pin
+            np.copyto(p["s"].numpy(), batch["s"])
+            np.copyto(p["s2"].numpy(), batch["s2"])
+            np.copyto(p["gt_south"].numpy(), batch["gt_south"])
+            np.copyto(p["gt_west"].numpy(), batch["gt_west"])
+            np.copyto(p["r"].numpy(), batch["r"])
+            np.copyto(p["a"].numpy(), batch["a"])
+            np.copyto(p["tau"].numpy(), batch["tau"])
+            np.copyto(p["terminal"].numpy(), batch["terminal"])
+            np.copyto(p["mask_b"].numpy(), batch["mask_b"])
+            np.copyto(p["mask_a2"].numpy(), batch["mask_a2"])
+            if use_graph:
+                # 首个学习步走 eager（建立 Adam 状态与稳定梯度缓冲），其后重放
+                if self._learn_graph is None and self.learn_steps >= 1:
+                    self._build_learn_graph()
+                if self._learn_graph is not None:
+                    self._learn_graph.replay()
+                    nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
+                    self.optimizer.step()
+                    self.learn_steps += 1
+                    torch.cuda.current_stream().synchronize()
+                    td_v, aux_v, tot_v = self._learn_loss_pin.tolist()
+                    return {"td_loss": td_v, "aux_loss": aux_v, "total_loss": tot_v}
+            st = {k: p[k].to(dev) for k in p}
+        else:
+            st = {k: torch.as_tensor(batch[k], device=dev) for k in
+                  ("s", "s2", "gt_south", "gt_west", "r", "a", "tau",
+                   "terminal", "mask_b", "mask_a2")}
+
+        td_loss, bce_t, loss = self._learn_body(st)
+        self.optimizer.zero_grad(set_to_none=(not use_graph))
         loss.backward()
         nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
         self.optimizer.step()

@@ -2,6 +2,43 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-21 — CUDA Graph 固化 act/学习体 + cuDNN 确定算法（agent.py，吞吐 ~1.9×，复现升级为参数级）
+
+### 改动（`algo/agent.py`，`TrainConfig.cuda_graph: bool = False` 门控默认关）
+
+1. **act 图**：捕获 [H2D→前向→dueling→统计→D2H(pinned)]。动态合法集 gather
+   等价改写为固定形状——argmax 全向量（非法=−inf，结果相同）+ 掩码均值
+   `where(m,q,0).sum()/m.sum()`（仅监控量，~1ulp 序差）；
+2. **学习图**：捕获 [H2D→3 前向→损失→反传→损失 D2H]。**clip_grad_norm_ 与
+   Adam.step 留在图外**（fused Adam eager 读静态梯度缓冲）——Adam 状态首次
+   创建、step 计数、stage1_lr 变更全部保持原语义，图无需重捕获；
+3. **warmup 无副作用**：侧流 3 次预热只跑前向+反向（无 optimizer.step），参数
+   与 Adam 状态零污染 → 图开关轨迹与参数逐位一致；
+4. **梯度缓冲静态化**：图路径 `zero_grad(set_to_none=False)` + 图内 `grad.zero_()`
+   起手（初版漏 `backward()` 的 bug 由等价性测试抓出并修复）；
+5. **cuDNN 确定算法**（CUDA 时强制 `cudnn.deterministic=True, benchmark=False`）：
+   默认 False 时 conv 反传选非确定核，同 seed 两次运行参数有 ~1e-8 漂移（轨迹
+   靠 argmax 鲁棒性才一致）；开启后复现从"轨迹级"升为"参数级"，且是 Graph 与
+   eager 逐位一致的前提；
+6. 构建失败 try/except 自动回退 eager；CPU 设备不启用。
+
+### 等价性验证（tests/test_trainer_smoke.py::test_cuda_graph_equivalence）
+
+同 seed 图开/关完整训练：option 轨迹、episode 核心列、**checkpoint 参数与优化器
+状态张量逐位一致**；14/14 测试过。
+
+### 实测（干净 GPU，确定模式，2500/500-option 差分法）
+
+| 路径 | 边际吞吐 | 单臂 160k |
+|---|---|---|
+| eager + 确定模式 | 13.6 ms/option（74/s） | ~36 分钟 |
+| **CUDA Graph + 确定模式** | **5.10 ms/option（196/s）** | **~16 分钟** |
+| （改前最快：非确定 eager + pinned） | 9.61 ms/option（104/s） | ~26 分钟 |
+
+Graph 相对确定模式 eager 2.7×、相对改前最快路径 ~1.9×。剩余热点为环境侧
+Python（雷达/账本/状态机），进一步压榨需 numba 化或 CUDA Graph 扩展到环境循环
+（形状动态，难度高），性价比低。
+
 ## 2026-11-21 — 学习/决策路径 H2D 提速：pinned 常驻暂存 + 同步合并（agent.py，吞吐 8×）
 
 ### 热点定位（cProfile + 分相微基准，500-option 短跑）

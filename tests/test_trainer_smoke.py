@@ -195,6 +195,45 @@ def test_repeat_moves_unit():
     print("[重复探索] OK：_repeat_moves 计数语义（起点不计/已访命中）")
 
 
+def test_cuda_graph_equivalence():
+    """CUDA Graph 开/关同 seed 训练：option 轨迹、episode 核心列、checkpoint
+    参数张量逐位一致（纯性能开关；构建失败自动回退 eager，两路必须同结果）。"""
+    import torch
+
+    if not torch.cuda.is_available():
+        print("[cuda graph] 跳过（无 CUDA）")
+        return
+    root1, root2 = "algo/runs/_test_cg_off", "algo/runs/_test_cg_on"
+    shutil.rmtree(root1, ignore_errors=True)
+    shutil.rmtree(root2, ignore_errors=True)
+    summaries = []
+    for out, flag in ((root1, False), (root2, True)):
+        cfg = tiny_cfg(out)
+        cfg.cuda_graph = flag
+        summaries.append(Trainer(cfg).run())
+    assert summaries[0]["options"] == summaries[1]["options"]
+    assert summaries[0]["learn_steps"] == summaries[1]["learn_steps"]
+    # option 轨迹逐位一致
+    rows = []
+    for out in (root1, root2):
+        with open(os.path.join(out, "options.csv"), encoding="utf-8") as f:
+            rows.append([(r["option"], r["tau"], r["reward"]) for r in csv.DictReader(f)])
+    assert rows[0] == rows[1] and len(rows[0]) > 0, "CUDA Graph 开/关 option 轨迹不一致"
+    # checkpoint 参数/优化器状态张量逐位一致
+    cks = [torch.load(os.path.join(out, "checkpoint_full_final.pt"),
+                      weights_only=False, map_location="cpu") for out in (root1, root2)]
+
+    def walk(a, b, path):
+        if torch.is_tensor(a):
+            assert torch.equal(a, b), f"CUDA Graph 参数不一致：{path}"
+        elif isinstance(a, dict):
+            assert set(a.keys()) == set(b.keys()), f"键集不一致：{path}"
+            for k in a:
+                walk(a[k], b[k], f"{path}.{k}")
+    walk(cks[0]["agent"], cks[1]["agent"], "agent")
+    print("[cuda graph] OK：开/关轨迹与参数逐位一致（含优化器状态）")
+
+
 def test_potential_shaping():
     """势能拉势 shaping（2026-11-21 A/C 塌缩修复）：公式逐项、终止分支、门控校验、端到端。"""
     import math
@@ -239,6 +278,7 @@ if __name__ == "__main__":
     test_stage_plan()
     test_monitor_null_and_validation()
     test_repeat_moves_unit()
+    test_cuda_graph_equivalence()
     test_potential_shaping()
     test_end_to_end_smoke()
     test_same_seed_reproducibility()

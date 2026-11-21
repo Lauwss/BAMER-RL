@@ -102,6 +102,10 @@ class TrainConfig:
     # 见 docs/ac_collapse_analysis.md。转正需用户确认（契约 D8 语义扩展）。
     shape_potential: bool = False
     shape_scale: float = 2000.0       # Φ∈[0,1] 全程拉势总量上限；2000 ≈ 2× 臂 B 每 bit 量级
+    # --- CUDA Graph（纯性能开关，默认关）：act/学习体内核固化，轨迹与 eager
+    # 逐位一致（warmup 无优化器副作用、clip/Adam.step 留在图外）；构建失败
+    # 自动回退 eager。CPU 设备无效。
+    cuda_graph: bool = False
     # --- 复现与产物 ---
     seed: int = 0
     out_dir: str = "algo/runs/exp"
@@ -166,7 +170,7 @@ class Trainer:
             grad_clip=cfg.grad_clip, eps_start=cfg.eps_start, eps_end=cfg.eps_end,
             eps_anneal_options=cfg.eps_anneal_options, capacity=cfg.capacity,
             n=self.n, aux_head=cfg.aux_head, use_gru=cfg.use_gru,
-            device=cfg.device, seed=int(cfg.seed))
+            device=cfg.device, seed=int(cfg.seed), use_cuda_graph=cfg.cuda_graph)
         self.belief = BeliefState(n=self.n, max_range=cfg.lidar_max_range)
         self.executor = Executor(self.belief, max_option_steps=cfg.env_max_steps)
         self.env: Optional[BamerEnv] = None
