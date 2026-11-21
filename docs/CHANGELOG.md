@@ -2,6 +2,39 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-21 — 每步管线性能等价优化（lazy_replan + scan_memo，吞吐 +47%）
+
+背景：frontier 引导后 option 平均长度 τ 3.5-5.0 → 12-18 步（定向远征），每步
+管线成本随 τ 线性放大，训练墙钟 21→45 分钟。块级剖析（10k options 实测，
+58.3 options/s）：maybe_learn 25.5% / env.step 25.3%（LiDAR 180 束投射占
+23.0%）/ belief.observe 21.3% / bfs_path 18.8% / legal_mask 5.4% / act 2.5%
+——GPU 非瓶颈，每步三件套合计 ~0.68ms/步。
+
+### 改动（均为确定性记忆化，轨迹逐位一致，单测实证）
+
+1. **lazy_replan**（`algo/executor.py`，`TrainConfig.lazy_replan=True`）：账本自
+   上次规划无变化时沿缓存路径后缀执行，跳过逐步 BFS；脏检测 = 每步
+   `np.array_equal` 比对 sensed_south/west 快照（~µs），任何新墙揭示即刻重规划。
+   等价性论证：BFS/运动学均确定 → 无新信息时现状重规划 = 缓存后缀；
+2. **scan_memo**（`algo/belief.py`，`TrainConfig.scan_memo=True`）：规范位姿
+   （格中心,朝向）确定场景下射线投射逐位确定 → 同 (cell,heading) 且量测一致
+   （`np.array_equal(..., equal_nan=True)` 兼容无回波 NaN）时跳过重复账本标记。
+   注：update_scan 已于 2026-11-20 向量化（束间锁步 DDA），剩余成本为 numpy
+   小数组调用固定开销，继续向量化收益有限——重复消除是更优等价变换；
+3. 默认开启（逐位一致已验证），可关做对照。
+
+### 实测（同一工作负载 10082 options / 160708 步）
+
+| 环节 | 前 | 后 |
+|---|---|---|
+| bfs_path | 32.5s（160.7k 次） | **2.1s（23.1k 次，−94%）** |
+| belief.observe | 36.9s | **18.3s（−50%）** |
+| 吞吐 | 58.3 options/s | **85.6 options/s（+47%）** |
+
+投影正式 run：45 → ~30 分钟/160k。剩余大头 = LiDAR 投射 33.7%（束数消融待
+定夺）+ 批学习 32.0%（learn_every 超参待消融）。单测 tests/test_perf_equivalence.py：
+四门控组合轨迹与基线逐位相同 + NaN 量测安全；全量回归 17/17。
+
 ## 2026-11-21 — frontier 引导（legal_mask 的 Explore 目标收窄为信念前沿格）
 
 诊断背景：固定迷宫 A/B 实验（下节）证伪"任务太难"假设——贪心死循环在确定性

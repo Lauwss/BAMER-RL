@@ -22,6 +22,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import numpy as np
+
 from bamer_env.maze import DIRS
 
 from .actions import option_target
@@ -97,9 +99,15 @@ class OptionResult:
 class Executor:
     """option 执行器：持有一个 BeliefState，驱动 BamerEnv 直到 option 终止。"""
 
-    def __init__(self, belief: BeliefState, max_option_steps: int = 512):
+    def __init__(self, belief: BeliefState, max_option_steps: int = 512,
+                 lazy_replan: bool = True):
         self.belief = belief
         self.max_option_steps = int(max_option_steps)
+        # 按需重规划（2026-11-21 性能等价变换）：账本自上次规划后无变化时，确定性
+        # BFS 从当前 (cell,heading) 必然给出缓存路径的剩余后缀 → 直接沿缓存执行，
+        # 跳过逐步 BFS。等价性：BFS/运动学均确定性，路径后缀 = 现状重规划结果。
+        # 账本逐帧比对（脏检测）保证任何新墙揭示即刻触发重规划，语义不变。
+        self.lazy_replan = bool(lazy_replan)
 
     # ---------- 规划 ----------
     def plan(self, target: Cell) -> Optional[List[str]]:
@@ -131,12 +139,29 @@ class Executor:
             result.success = True
             return result
 
+        plan: Optional[List[str]] = None    # 缓存路径（lazy 模式沿后缀执行）
+        plan_i = 0
+        plan_ledger: Optional[Tuple[np.ndarray, np.ndarray]] = None
         while result.steps < self.max_option_steps:
-            plan = self.plan(target)
-            if plan is None:
-                result.aborted = True       # 不可达中止（失败信号交还高层）
-                break
-            prim = plan[0]                  # 每步重规划：只执行第一个原语
+            if self.lazy_replan:
+                dirty = (plan is None or plan_i >= len(plan)
+                         or not (np.array_equal(plan_ledger[0], b.ledger.sensed_south)
+                                 and np.array_equal(plan_ledger[1], b.ledger.sensed_west)))
+                if dirty:
+                    plan = self.plan(target)
+                    plan_i = 0
+                    if plan is None:
+                        result.aborted = True   # 不可达中止（失败信号交还高层）
+                        break
+                    plan_ledger = (b.ledger.sensed_south.copy(), b.ledger.sensed_west.copy())
+                prim = plan[plan_i]             # 无新信息：缓存后缀 = 现状重规划结果
+                plan_i += 1
+            else:
+                plan = self.plan(target)
+                if plan is None:
+                    result.aborted = True       # 不可达中止（失败信号交还高层）
+                    break
+                prim = plan[0]                  # 每步重规划：只执行第一个原语
             obs, _, terminated, truncated, info = env.step(prim)
             result.steps += 1
             result.events.extend(info["events"])

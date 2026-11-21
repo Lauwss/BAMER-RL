@@ -84,6 +84,9 @@ class TrainConfig:
     # 出候选集 → 贪心微步环结构性消除；ε 采样池同步收窄（与§改动2合并实现，
     # 两者在掩码实现下等价）。frontier 为空（可达区域完全观测）回退全可达集。
     frontier_mask: bool = False
+    # --- 每步管线性能等价变换（2026-11-21，逐位一致已单测验证；剖析见 CHANGELOG） ---
+    lazy_replan: bool = True          # executor 账本无变化时沿缓存路径执行，跳过逐步 BFS
+    scan_memo: bool = True            # belief 同 (cell,heading) 同量测的重复扫描账本标记跳过
     # --- 网络/智能体（§4.5 默认表） ---
     gamma: float = 0.99
     lr: float = 1e-4
@@ -201,8 +204,10 @@ class Trainer:
             eps_anneal_options=cfg.eps_anneal_options, capacity=cfg.capacity,
             n=self.n, aux_head=cfg.aux_head, use_gru=cfg.use_gru,
             device=cfg.device, seed=int(cfg.seed), use_cuda_graph=cfg.cuda_graph)
-        self.belief = BeliefState(n=self.n, max_range=cfg.lidar_max_range)
-        self.executor = Executor(self.belief, max_option_steps=cfg.env_max_steps)
+        self.belief = BeliefState(n=self.n, max_range=cfg.lidar_max_range,
+                                  scan_memo=cfg.scan_memo)
+        self.executor = Executor(self.belief, max_option_steps=cfg.env_max_steps,
+                                 lazy_replan=cfg.lazy_replan)
         self.env: Optional[BamerEnv] = None
         self._fixed_maze = None    # maze_fixed 时的共享迷宫实例（懒构建）
         self.reward_fn: Callable = self._reward_full

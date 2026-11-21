@@ -72,8 +72,8 @@ def run_eval(config_path: str, checkpoint: str, n_seeds: int) -> None:
     agent.load_state_dict(ckpt["agent"])
 
     seeds = [int(s) for s in np.random.default_rng(cfg.seed + 777).integers(0, 2**31 - 1, n_seeds)]
-    belief = BeliefState(n=cfg.maze_n, max_range=cfg.lidar_max_range)
-    executor = Executor(belief, max_option_steps=cfg.env_max_steps)
+    belief = BeliefState(n=cfg.maze_n, max_range=cfg.lidar_max_range, scan_memo=cfg.scan_memo)
+    executor = Executor(belief, max_option_steps=cfg.env_max_steps, lazy_replan=cfg.lazy_replan)
     summary = evaluate(agent, build_env_factory(cfg), seeds, belief, executor, suite="held-out",
                        frontier_only=cfg.frontier_mask)
 

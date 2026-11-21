@@ -292,7 +292,7 @@ class BeliefState:
     """
 
     def __init__(self, n: int = 16, classifier: Optional[IdentityClassifier] = None,
-                 max_range: float = 2.0):
+                 max_range: float = 2.0, scan_memo: bool = True):
         self.n = int(n)
         self.classifier = classifier if classifier is not None else GTAssetClassifier()
         self.max_range = float(max_range)
@@ -308,6 +308,11 @@ class BeliefState:
         self.visited: Set[Cell] = set()             # 累计到访格（轨迹账本·全历史）
         self.prev_option_path: List[Cell] = []      # 上一个 option 实际走过的格序列
         self.prev_boundary_cell: Optional[Cell] = None  # 上一个决策边界位置
+        # 扫描记忆化（2026-11-21 性能等价变换）：规范位姿（格中心,朝向）确定场景下
+        # 射线投射结果逐位确定 → 同 (cell, heading) 且量测一致时账本标记幂等，可跳过。
+        # ranges 逐帧比对（equal_nan）保证噪声/异帧不误跳； episode 内 dict ≤256×4 项。
+        self.scan_memo = bool(scan_memo)
+        self._scan_memo: Dict[Tuple[Cell, str], np.ndarray] = {}
 
     # ---------- 生命周期 ----------
     def reset(self, n: Optional[int] = None) -> None:
@@ -323,6 +328,7 @@ class BeliefState:
         self.visited = set()
         self.prev_option_path = []
         self.prev_boundary_cell = None
+        self._scan_memo.clear()
 
     # ---------- 每步观测更新（R1 合法通道唯一入口） ----------
     def observe(self, obs: dict, info: dict) -> None:
@@ -340,7 +346,16 @@ class BeliefState:
         ranges = info.get("ranges")
         if ranges is not None:
             cx, cy = self.cell[0] + 0.5, self.cell[1] + 0.5   # 规范位姿 = 格中心
-            self.ledger.update_scan(ranges, info["angles"], cx, cy, self.heading, self.max_range)
+            hit = None
+            if self.scan_memo:
+                hit = self._scan_memo.get((self.cell, self.heading))
+            if hit is not None and np.array_equal(hit, ranges, equal_nan=True):
+                pass    # 同位姿同量测：账本标记幂等，跳过重复 update_scan（精确等价）
+            else:
+                self.ledger.update_scan(ranges, info["angles"], cx, cy, self.heading,
+                                        self.max_range)
+                if self.scan_memo:
+                    self._scan_memo[(self.cell, self.heading)] = ranges
 
         for ev in info.get("events", ()):
             self._on_event(ev)
