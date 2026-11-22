@@ -1,0 +1,54 @@
+# max1500（2026-11-22）：组合臂 × env_max_steps 1000→1500，seed 0
+# 问题：1000 步 cap 下失败 episode 全部是 POI 未齐超时（成功率 53%）——cap 放宽
+# 到 1500 后成功率是否上升，区分"找不到"（cap 无关）与"时间不够"（cap 放宽即涨）。
+# 配对对照 = armA_frontier_combo_s0（同 seed 同栈 cap=1000，统一套件 53%）。
+# 注：奖励 −1/步 + 终点奖金结构下最优策略不随 cap 变化，cap 只改截断语义与
+# episode 内经验分布；评估套件同为 seed_base=0 100-seed（评估 env 同用 1500）。
+arm: A
+stage0_options: 40000
+stage1_options: 120000
+stage1_eps_restart: 0.05
+stage1_lr: null
+
+env_randomize: true
+env_max_steps: 1500            # 本次唯一变更：步数上限 1000 → 1500
+lidar_n_beams: 180
+lidar_max_range: 2.0
+swanlab: true
+swanlab_project: BAMER-RL
+swanlab_mode: cloud
+eval_every_options: 10000
+eval_mini_seeds: 3
+maze_n: 16
+maze_braiding_stage0: 0.0
+maze_loops_stage0: [0, 30]
+maze_braiding_stage1: 0.8
+maze_loops_stage1: [25, 50]
+frontier_mask: true            # 同栈：frontier 引导
+dist_channel: true             # 感受野修复①：末通道 = BFS 距离场
+dilated_backbone: true         # 感受野修复②：主干 dilation 1/2/4（RF 7→15）
+learn_every: 2                 # 学习间隔减半更新频率（超参变更，learn2 判据 +25pp 待新栈复核）
+
+gamma: 0.999
+lr: 1.0e-4
+batch_size: 64
+target_sync_options: 1000
+warmup_options: 2000
+lambda_aux: 0.5
+grad_clip: 10.0
+eps_start: 0.10
+eps_end: 0.02
+eps_anneal_options: 20000
+capacity: 100000
+aux_head: true
+use_traj: true
+use_gru: false
+
+shape_potential: true
+shape_scale: 2000.0
+cuda_graph: true
+
+seed: 0
+out_dir: algo/runs/armA_frontier_combo_max1500
+checkpoint_every_options: 10000
+smoke: false
