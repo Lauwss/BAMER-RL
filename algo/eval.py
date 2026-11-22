@@ -128,7 +128,8 @@ def omniscient_reference(scene: Scene) -> Optional[int]:
 
 # ---------- 套件评估 ----------
 def run_eval_episode(agent, env, belief: BeliefState, executor, seed: int,
-                     max_steps: int, frontier_only: bool = False) -> EpisodeMetrics:
+                     max_steps: int, frontier_only: bool = False,
+                     fallback_unvisited: bool = False) -> EpisodeMetrics:
     """贪心（ε=0）跑一条完整 episode，只统计不学习。"""
     obs, info = env.reset(seed=seed)
     belief.reset(env.scene.maze.n)
@@ -140,7 +141,7 @@ def run_eval_episode(agent, env, belief: BeliefState, executor, seed: int,
     abort_guard = 0
     while True:
         s = belief.tensor()
-        mask = _legal_mask_safe(belief, frontier_only)
+        mask = _legal_mask_safe(belief, frontier_only, fallback_unvisited)
         action = agent.act(s, mask, greedy=True)
         result = executor.run(env, action)
         options += 1
@@ -169,20 +170,24 @@ def run_eval_episode(agent, env, belief: BeliefState, executor, seed: int,
     )
 
 
-def _legal_mask_safe(belief: BeliefState, frontier_only: bool = False):
+def _legal_mask_safe(belief: BeliefState, frontier_only: bool = False,
+                     fallback_unvisited: bool = False):
     from .actions import legal_mask
-    return legal_mask(belief, frontier_only=frontier_only)
+    return legal_mask(belief, frontier_only=frontier_only,
+                      fallback_unvisited=fallback_unvisited)
 
 
 def evaluate(agent, env_factory: Callable[[], object], seeds: Sequence[int],
              belief: BeliefState, executor, suite: str = "held-out",
-             frontier_only: bool = False) -> EvalSummary:
+             frontier_only: bool = False,
+             fallback_unvisited: bool = False) -> EvalSummary:
     """固定 seed 套件评估（§7.2：held-out 随机套件 / 官方图套件分开报告）。"""
     metrics: List[EpisodeMetrics] = []
     for seed in seeds:
         env = env_factory()
         metrics.append(run_eval_episode(agent, env, belief, executor, int(seed),
-                                        env.max_steps, frontier_only=frontier_only))
+                                        env.max_steps, frontier_only=frontier_only,
+                                        fallback_unvisited=fallback_unvisited))
         try:
             env.close()
         except Exception:

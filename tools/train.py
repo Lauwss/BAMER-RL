@@ -80,7 +80,8 @@ def run_eval(config_path: str, checkpoint: str, n_seeds: int) -> None:
                          use_dist=cfg.dist_channel, use_dir=cfg.dir_channel)
     executor = Executor(belief, max_option_steps=cfg.env_max_steps, lazy_replan=cfg.lazy_replan)
     summary = evaluate(agent, build_env_factory(cfg), seeds, belief, executor, suite="held-out",
-                       frontier_only=cfg.frontier_mask)
+                       frontier_only=cfg.frontier_mask,
+                       fallback_unvisited=cfg.fallback_unvisited)
 
     # 逐 seed 场景复现（参照计算需要布点 GT：评估侧特权）
     from bamer_env.env import BamerEnv

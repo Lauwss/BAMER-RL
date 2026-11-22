@@ -2,6 +2,17 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-22 — fallback_unvisited 训练侧消融：60→91% 全额兑现（门控接入 TrainConfig）
+
+把 funv 门控从 legal_mask 层接入 TrainConfig（默认 False 逐位不变，全量单测
+过）/训练循环/mini eval/评估链（`algo/trainer.py`、`algo/eval.py`、
+`tools/train.py`）并训练 `armA_frontier_combo_max1500_funv.yaml`（combo+1500+训练侧
+开启）。统一套件 100-seed：**91.0%**（对照关 60.0%，+31pp）= 评估侧 A/B 的
+90-92% 天花板；截断率 9% 与"剩余~9%=真预算问题"注记对上；POI 定位率 93% 首次
+高于成功率（2 例定位后派送未完，此前派送段零失败）。**当前最优口径 = 训练期+
+评估期一致开启**；转正（默认 True）待用户确认走契约流程。
+详见 [docs/funv_train_20261122.md](funv_train_20261122.md)。
+
 ## 2026-11-22 — 2/3 上限定性：失败≈纯"识别盲区"（信息死格不踩）——fallback_unvisited 门控评估侧修复 68→91/69→92/73→90，@1000 无害（默认关逐位不变）
 
 

@@ -84,6 +84,11 @@ class TrainConfig:
     # 出候选集 → 贪心微步环结构性消除；ε 采样池同步收窄（与§改动2合并实现，
     # 两者在掩码实现下等价）。frontier 为空（可达区域完全观测）回退全可达集。
     frontier_mask: bool = False
+    # fallback_unvisited（2026-11-22 盲区修复，评估侧 A/B 见 CHANGELOG 2/3 上限定性）：
+    # frontier 空的回退集从全可达收窄为未到访可达格——信息闭合后剩余唯一任务信号
+    # 就是踩格（识别须进格）；默认 False = 旧行为逐位不变。训练期开启为候选训练侧
+    # 修复（让 ε 采到 ImageFeed→Pickup 转移），本 run 为训练侧消融（用户指令）。
+    fallback_unvisited: bool = False
     # --- 感受野修复（2026-11-22 GPT 外部批评核实，均默认关 = 旧行为） ---
     # dist_channel：信念张量追加末通道 = BFS 距离场（belief.distance_field，账本
     # 纯派生、R1 合法）——Q 代价项 −τ/γ^τ 的主特征在目标格自身位置 RF-1 可读，
@@ -448,7 +453,8 @@ class Trainer:
 
         while True:
             s = self.belief.tensor(use_traj=cfg.use_traj)
-            mask = legal_mask(self.belief, frontier_only=cfg.frontier_mask)
+            mask = legal_mask(self.belief, frontier_only=cfg.frontier_mask,
+                              fallback_unvisited=cfg.fallback_unvisited)
             action = self.agent.act(s, mask)
             unknown_before = self.belief.ledger.unknown_count()
             # 本 option 开始前的已访快照：executor 执行期间每步 observe 都会把
@@ -463,7 +469,8 @@ class Trainer:
             unknown_after = self.belief.ledger.unknown_count()
 
             s2 = self.belief.tensor(use_traj=cfg.use_traj)
-            mask2 = legal_mask(self.belief, frontier_only=cfg.frontier_mask)
+            mask2 = legal_mask(self.belief, frontier_only=cfg.frontier_mask,
+                               fallback_unvisited=cfg.fallback_unvisited)
             reward = self.reward_fn(result, unknown_before, unknown_after)
             if cfg.shape_potential:
                 reward = self._shape_reward(reward, unknown_before, unknown_after,
@@ -542,7 +549,8 @@ class Trainer:
 
         summary = evaluate(self.agent, self._mini_eval_env_factory, self._mini_eval_seeds,
                            self.belief, self.executor, suite="mini",
-                           frontier_only=self.cfg.frontier_mask)
+                           frontier_only=self.cfg.frontier_mask,
+                           fallback_unvisited=self.cfg.fallback_unvisited)
         self.monitor.log_eval({
             "success_rate": summary.success_rate,
             "mean_total_steps": summary.mean_total_steps,
