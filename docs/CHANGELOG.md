@@ -2,6 +2,16 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-22 — **fallback_unvisited 转正（默认 True，用户确认）**
+
+`TrainConfig.fallback_unvisited` 默认 False→True（`algo/trainer.py`）：frontier 空
+的回退集默认收窄为未到访可达格。证据双侧齐备——评估侧 A/B（e0dbb35，@1500
+全额兑现 +23/+23/+17pp、@1000 无害）+ 训练侧消融（combo_max1500_funv，统一
+套件 91.0% vs 关 60.0%）。**复现 2026-11-22 前旧行为须显式 `fallback_unvisited:
+false`**（既有不含该键的历史配置重跑将走新默认，与 lazy_replan/scan_memo 转正
+同模式）；`legal_mask` 低层函数默认值保持 False（所有调用点已显式传参）。
+全量单测过。
+
 ## 2026-11-22 — fallback_unvisited 训练侧消融：60→91% 全额兑现（门控接入 TrainConfig）
 
 把 funv 门控从 legal_mask 层接入 TrainConfig（默认 False 逐位不变，全量单测

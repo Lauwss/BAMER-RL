@@ -84,11 +84,14 @@ class TrainConfig:
     # 出候选集 → 贪心微步环结构性消除；ε 采样池同步收窄（与§改动2合并实现，
     # 两者在掩码实现下等价）。frontier 为空（可达区域完全观测）回退全可达集。
     frontier_mask: bool = False
-    # fallback_unvisited（2026-11-22 盲区修复，评估侧 A/B 见 CHANGELOG 2/3 上限定性）：
-    # frontier 空的回退集从全可达收窄为未到访可达格——信息闭合后剩余唯一任务信号
-    # 就是踩格（识别须进格）；默认 False = 旧行为逐位不变。训练期开启为候选训练侧
-    # 修复（让 ε 采到 ImageFeed→Pickup 转移），本 run 为训练侧消融（用户指令）。
-    fallback_unvisited: bool = False
+    # fallback_unvisited（2026-11-22 盲区修复）：frontier 空的回退集从全可达收窄为
+    # 未到访可达格——信息闭合后剩余唯一任务信号就是踩格（识别须进格，进零信息格
+    # 无 frontier/shaping 梯度）。**已转正（2026-11-22 用户确认，默认 True）**：证据
+    # = 评估侧 A/B（e0dbb35，@1500 全额兑现 +23/+23/+17pp、@1000 无害）+ 训练侧
+    # 消融（combo_max1500_funv，统一套件 91.0% vs 关 60.0%，见
+    # docs/funv_train_20261122.md）。复现 2026-11-22 前旧行为须显式
+    # fallback_unvisited: false。
+    fallback_unvisited: bool = True
     # --- 感受野修复（2026-11-22 GPT 外部批评核实，均默认关 = 旧行为） ---
     # dist_channel：信念张量追加末通道 = BFS 距离场（belief.distance_field，账本
     # 纯派生、R1 合法）——Q 代价项 −τ/γ^τ 的主特征在目标格自身位置 RF-1 可读，
