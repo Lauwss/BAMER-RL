@@ -58,6 +58,7 @@ class SMDPDQNAgent:
                  grad_clip: float = 10.0, eps_start: float = 0.10, eps_end: float = 0.02,
                  eps_anneal_options: int = 20000, capacity: int = 100_000,
                  n: int = 16, aux_head: bool = True, use_gru: bool = False,
+                 dist_channel: bool = False, dilated: bool = False,
                  device: Optional[str] = None, seed: int = 0,
                  use_cuda_graph: bool = False):
         self.device = torch.device(device) if device else torch.device(
@@ -70,8 +71,10 @@ class SMDPDQNAgent:
             # 小网络实测无显著速度代价。
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-        self.online = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru).to(self.device)
-        self.target = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru).to(self.device)
+        self.online = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru,
+                             dist_channel=dist_channel, dilated=dilated).to(self.device)
+        self.target = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru,
+                             dist_channel=dist_channel, dilated=dilated).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         for p in self.target.parameters():
             p.requires_grad_(False)
@@ -102,9 +105,10 @@ class SMDPDQNAgent:
         self.eps_start, self.eps_end = float(eps_start), float(eps_end)
         self.eps_anneal_options = max(1, int(eps_anneal_options))
         self.eps_override: Optional[float] = None     # 课程阶段切换时 ε 从低值重启
-        # 经验池与计数
+        # 经验池与计数（channels=输入通道数；2026-11-22 参数化——原硬编码 16，
+        # use_traj=False / dist_channel=True 时形状失配的潜在 bug 一并修复）
         from .replay import ReplayBuffer
-        self.buffer = ReplayBuffer(capacity, n=n)
+        self.buffer = ReplayBuffer(capacity, n=n, channels=in_channels)
         self.options_seen = 0
         self.learn_steps = 0
         self._last_target_sync = 0
@@ -120,8 +124,8 @@ class SMDPDQNAgent:
             bz = self.batch_size
             pn = self.n
             self._pin = {
-                "s":   torch.empty((bz, 16, pn, pn), dtype=torch.uint8, pin_memory=True),
-                "s2":  torch.empty((bz, 16, pn, pn), dtype=torch.uint8, pin_memory=True),
+                "s":   torch.empty((bz, self.in_channels, pn, pn), dtype=torch.uint8, pin_memory=True),
+                "s2":  torch.empty((bz, self.in_channels, pn, pn), dtype=torch.uint8, pin_memory=True),
                 "gt_south": torch.empty((bz, pn, pn), dtype=torch.uint8, pin_memory=True),
                 "gt_west":  torch.empty((bz, pn, pn), dtype=torch.uint8, pin_memory=True),
                 "r":   torch.empty((bz,), dtype=torch.float32, pin_memory=True),

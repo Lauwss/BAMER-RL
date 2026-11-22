@@ -28,14 +28,14 @@ from .actions import N_OPTIONS
 class ReplayBuffer:
     """环形 uint8 经验池。"""
 
-    def __init__(self, capacity: int, n: int = 16):
+    def __init__(self, capacity: int, n: int = 16, channels: int = 16):
         self.capacity = int(capacity)
         self.n = int(n)
         c = self.capacity
-        self.s = np.zeros((c, 16, n, n), dtype=np.uint8)
+        self.s = np.zeros((c, channels, n, n), dtype=np.uint8)
         self.a = np.zeros(c, dtype=np.int16)
         self.r = np.zeros(c, dtype=np.float32)
-        self.s2 = np.zeros((c, 16, n, n), dtype=np.uint8)
+        self.s2 = np.zeros((c, channels, n, n), dtype=np.uint8)
         self.tau = np.zeros(c, dtype=np.int16)
         self.terminal = np.zeros(c, dtype=bool)
         self.mask_b = np.zeros((c, N_OPTIONS), dtype=bool)     # s_before 合法掩码

@@ -1,0 +1,54 @@
+# 感受野修复消融臂③（2026-11-22，GPT 外部批评核实）：距离通道 + 膨胀卷积组合
+# 对照 armA_g0999_aux05_frontier（同栈基线）。两机制正交互补：
+# dist_channel 治代价侧（−τ/γ^τ 主特征 RF-1 可读），dilated_backbone 治收益侧
+# （区域结构 RF 15 可见）。预期组合臂为三臂中最优；若不及单侧，说明两机制
+# 在学习动力学上相互干扰（候选解释：输入分布变化过快，需课程式启用）。
+# 验收判据：两个探针 ρ 同时改善 + 30-seed held-out 成功率与搜索超时率。
+arm: A
+stage0_options: 40000
+stage1_options: 120000
+stage1_eps_restart: 0.05
+stage1_lr: null
+
+env_randomize: true
+env_max_steps: 1000
+lidar_n_beams: 180
+lidar_max_range: 2.0
+swanlab: true
+swanlab_project: BAMER-RL
+swanlab_mode: cloud
+eval_every_options: 10000
+eval_mini_seeds: 3
+maze_n: 16
+maze_braiding_stage0: 0.0
+maze_loops_stage0: [0, 30]
+maze_braiding_stage1: 0.8
+maze_loops_stage1: [25, 50]
+frontier_mask: true            # 与基线同栈：frontier 引导保持开启
+
+dist_channel: true             # ← 消融主变量①：末通道 = BFS 距离场
+dilated_backbone: true         # ← 消融主变量②：主干 dilation 1/2/4
+
+gamma: 0.999
+lr: 1.0e-4
+batch_size: 64
+target_sync_options: 1000
+warmup_options: 2000
+lambda_aux: 0.5
+grad_clip: 10.0
+eps_start: 0.10
+eps_end: 0.02
+eps_anneal_options: 20000
+capacity: 100000
+aux_head: true
+use_traj: true
+use_gru: false
+
+shape_potential: true
+shape_scale: 2000.0
+cuda_graph: true
+
+seed: 0
+out_dir: algo/runs/armA_frontier_dist_dilate
+checkpoint_every_options: 10000
+smoke: false

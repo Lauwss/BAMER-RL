@@ -8,9 +8,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 
 from algo.belief import (
-    CH_CARRY_QUYUAN, CH_POSE_N, CH_POSE_PREV_BOUNDARY, CH_POI_CHUGUO, CH_POI_QUYUAN,
+    CH_CARRY_QUYUAN, CH_DIST, CH_POSE_N, CH_POSE_PREV_BOUNDARY, CH_POI_CHUGUO, CH_POI_QUYUAN,
     CH_TRAIL_PREV_OPTION, CH_WALL_E, CH_WALL_N, CH_WALL_S, CH_WALL_W, BeliefState,
-    GTAssetClassifier, HEADINGS, SensingLedger, W_FREE, W_UNKNOWN, W_WALL,
+    DIST_CAP, GTAssetClassifier, HEADINGS, SensingLedger, W_FREE, W_UNKNOWN, W_WALL,
 )
 from bamer_env import BamerEnv, Maze
 from bamer_mouse.lidar import LidarSpec
@@ -200,6 +200,52 @@ def test_gt_asset_classifier():
     print("[GT 分类器] OK：资产引用→身份（机器/终点），缺引用报错")
 
 
+def test_distance_field_handcheck():
+    """距离场手算对拍（2026-11-22 距离通道）：走廊/折行支路/围死区域。
+
+    图与可达语义与 actions.reachable_cells 同源（开放边界=已探明无墙、unknown
+    不可通行的悲观约定）。槽位记账约定：sensed_west[x,y] = (x,y) 西界（即
+    (x-1,y)-(x,y) 边界）、sensed_south[x,y] = (x,y) 南界。
+    """
+    b = BeliefState(n=5, use_dist=True)
+    b.cell = (0, 0)
+    led = b.ledger
+    for x in range(1, 5):                     # 东向走廊 (0,0)-(1,0)-(2,0)-(3,0)-(4,0)
+        led._mark(led.sensed_west, x, 0, W_FREE)
+    led._mark(led.sensed_south, 2, 1, W_FREE)  # (2,0)-(2,1) 边界开放（(2,1) 南界）
+    led._mark(led.sensed_west, 3, 1, W_FREE)   # (2,1)-(3,1) 边界开放
+    d = b.distance_field()
+    assert d[0, 0] == 0                        # 当前格 = 0
+    for x, want in [(1, 1), (2, 2), (3, 3), (4, 4)]:
+        assert d[x, 0] == want, f"走廊距离错: ({x},0)={d[x, 0]}≠{want}"
+    assert d[2, 1] == 3 and d[3, 1] == 4       # 支路经 (2,0) 折行
+    assert d[2, 2] == DIST_CAP                 # 围死（四界全 unknown）→ 饱和
+    assert d[4, 4] == DIST_CAP                 # 不可达 → 饱和（与"极远"同值，恒被掩码排除）
+    print("[距离场手算] OK：走廊/支路折行/围死饱和（悲观可达语义）")
+
+
+def test_tensor_dist_channel():
+    """17 通道派生：前 16 通道与旧 16ch 张量逐位一致；末通道 = 距离场；use_traj=False 组合。"""
+    def build(use_dist):
+        b = BeliefState(n=5, use_dist=use_dist)
+        b.cell = (0, 0)
+        b.ledger._mark(b.ledger.sensed_west, 1, 0, W_FREE)
+        b.ledger._mark(b.ledger.sensed_south, 0, 1, W_FREE)
+        return b
+
+    b, b16 = build(True), build(False)
+    T17, T16 = b.tensor(), b16.tensor()
+    assert T17.shape == (17, 5, 5) and T16.shape == (16, 5, 5)
+    assert np.array_equal(T17[:16], T16)       # 前缀逐位一致（默认路径不受影响）
+    assert np.array_equal(T17[CH_DIST], b.distance_field())
+    assert T17[CH_DIST, 0, 0] == 0 and T17[CH_DIST, 1, 0] == 1 and T17[CH_DIST, 2, 2] == DIST_CAP
+    T15 = b.tensor(use_traj=False)
+    assert T15.shape == (15, 5, 5)             # 14 基础 + 距离（无轨迹）
+    assert np.array_equal(T15[:14], T16[:14])
+    assert np.array_equal(T15[14], T17[CH_DIST])
+    print("[距离通道张量] OK：前缀逐位一致 / 末通道=距离场 / 15ch 组合")
+
+
 if __name__ == "__main__":
     test_ledger_handcheck_reset_scan()
     test_ledger_monotone_wall_sticky()
@@ -207,4 +253,6 @@ if __name__ == "__main__":
     test_tensor_delivered_and_destination()
     test_r1_selfcheck_gt_free_stream()
     test_gt_asset_classifier()
+    test_distance_field_handcheck()
+    test_tensor_dist_channel()
     print("\n信念层单测全部通过 [PASS]")

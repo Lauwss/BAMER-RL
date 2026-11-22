@@ -35,6 +35,7 @@ wall_south[x][y] asarray 后即 [x, y]）。所有通道共用同一布局，位
 """
 import math
 import os
+from collections import deque
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -55,6 +56,16 @@ CH_TRAIL_PREV_OPTION = 14
 CH_POSE_PREV_BOUNDARY = 15
 N_CHANNELS = 16
 BASE_CHANNELS = 14              # use_traj=False 消融：裁剪轨迹双通道
+
+# --- 距离通道（2026-11-22 感受野批评修复§改动1，门控 BeliefState(use_dist)） ---
+# 每格存"从当前格起、已知空闲图上的 BFS 距离"（与 reachable_cells 同图同语义）。
+# 这是 Q 代价项 −τ/γ^τ 的主特征：位姿是单像素（半径 3 外不可见），距离写在目标格
+# 自身位置上 → explore head 感受野 1 即可读，γ^τ 从"局部观测密度代理"变精确量。
+# 序数量（非类别）：0=当前格，1..CAP-1=BFS 步数；≥CAP 与不可达一律饱和到 CAP
+# （不可达格恒被合法掩码排除，无需与"极远"区分）。
+CH_DIST = 16
+N_CHANNELS_DIST = 17
+DIST_CAP = 64                   # 4× 边长；蛇形长廊实测 ≤57（30-seed 探针）
 
 POI_CHANNELS = {"quyuan": CH_POI_QUYUAN, "zhaojun": CH_POI_ZHAOJUN}
 DEST_CHANNELS = {"chuguo": CH_POI_CHUGUO, "xihan": CH_POI_XIHAN}
@@ -292,11 +303,13 @@ class BeliefState:
     """
 
     def __init__(self, n: int = 16, classifier: Optional[IdentityClassifier] = None,
-                 max_range: float = 2.0, scan_memo: bool = True):
+                 max_range: float = 2.0, scan_memo: bool = True, use_dist: bool = False):
         self.n = int(n)
         self.classifier = classifier if classifier is not None else GTAssetClassifier()
         self.max_range = float(max_range)
         self.ledger = SensingLedger(self.n)
+        # 距离通道门控（2026-11-22）：True 时 tensor() 返回 (17,n,n)，末通道 = BFS 距离场
+        self.use_dist = bool(use_dist)
         # 事件簿记（全部来自合法通道；识别身份经分类器，见模块 docstring）
         self.machine_known: Dict[str, Cell] = {}    # 已识别机器 → 识别位置（当步自身格）
         self.machine_delivered: Set[str] = set()
@@ -409,14 +422,42 @@ class BeliefState:
         return len(self.machine_known) >= len(MACHINE_NAMES) and \
             len(self.dest_known) >= len(DEST_NAMES)
 
+    def distance_field(self) -> np.ndarray:
+        """BFS 距离场（2026-11-22 距离通道的派生源，账本纯派生、无写入路径）。
+
+        从当前格起、已知空闲图上 4 连通 BFS——图与可达语义与 actions.reachable_cells
+        完全同源（开放边界 = 已探明无墙；unknown = 不可通行的悲观约定）。返回 uint8
+        (n,n)：0 = 当前格，1..CAP−1 = BFS 步数；≥CAP 与不可达一律饱和到 DIST_CAP。
+        每决策边界调用一次（256 格 BFS，µs 级，相对管线可忽略）。
+        """
+        n = self.n
+        dist = np.full((n, n), DIST_CAP, dtype=np.uint8)
+        start = self.cell
+        dist[start] = 0
+        dq = deque([start])
+        while dq:
+            x, y = dq.popleft()
+            d = dist[x, y]
+            if d + 1 >= DIST_CAP:       # 已饱和的格不再扩展（其邻居同样 ≥CAP，无信息）
+                continue
+            for direction, (dx, dy) in zip(HEADINGS, ((0, 1), (1, 0), (0, -1), (-1, 0))):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < n and 0 <= ny < n and dist[nx, ny] == DIST_CAP \
+                        and self.open_boundary((x, y), direction):
+                    dist[nx, ny] = d + 1
+                    dq.append((nx, ny))
+        return dist
+
     # ---------- 16 通道信念张量派生 ----------
     def tensor(self, use_traj: bool = True) -> np.ndarray:
         """由账本一次性重建信念张量（§2.1 定稿；无写入路径，每次全量派生）。
 
-        返回 (16,16,16) uint8（use_traj=False 时 (14,16,16)）；布局 [C, x, y]。
+        返回 (16,16,16) uint8（use_traj=False 时 (14,16,16)；构造 use_dist=True 时
+        追加 CH_DIST 距离通道 → (17,16,16) / (15,16,16)）；布局 [C, x, y]。
         """
         n = self.n
-        T = np.zeros((N_CHANNELS, n, n), dtype=np.uint8)
+        c_total = N_CHANNELS_DIST if self.use_dist else N_CHANNELS
+        T = np.zeros((c_total, n, n), dtype=np.uint8)
         south, west = self.ledger.sensed_south, self.ledger.sensed_west
 
         # --- 墙位 4 通道（0=unknown 1=free 2=wall；派生值 = sensed ? (wall?2:1) : 0） ---
@@ -451,6 +492,10 @@ class BeliefState:
             if ch is not None:
                 T[ch] = 1
 
+        # --- 距离通道（2026-11-22 感受野修复§改动1：Q 代价项主特征，账本纯派生） ---
+        if self.use_dist:
+            T[CH_DIST] = self.distance_field()
+
         # --- 轨迹双通道（新近性上下文；episode 首边界全零 = 未知约定） ---
         if use_traj:
             for cx, cy in self.prev_option_path:
@@ -458,6 +503,9 @@ class BeliefState:
             if self.prev_boundary_cell is not None:
                 T[CH_POSE_PREV_BOUNDARY, self.prev_boundary_cell[0], self.prev_boundary_cell[1]] = 1
             return T
+        if self.use_dist:
+            # 裁剪轨迹：14 基础 + 距离通道（距离恒居末位，与 chan_scale[-1] 对齐）
+            return np.concatenate([T[:BASE_CHANNELS], T[CH_DIST:CH_DIST + 1]], axis=0)
         return T[:BASE_CHANNELS].copy()
 
     # ---------- 辅助任务 GT 通道（训练监督专用，非决策输入） ----------

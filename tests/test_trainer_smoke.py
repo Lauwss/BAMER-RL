@@ -274,6 +274,24 @@ def test_potential_shaping():
     print("[拉势shaping] OK：公式逐项、terminated 分支、门控校验、端到端确定性")
 
 
+def test_rf_fix_smoke(tmp_root="algo/runs/_test_rf_fix"):
+    """感受野修复端到端冒烟（2026-11-22）：dist_channel + dilated_backbone 双开小预算训练。"""
+    shutil.rmtree(tmp_root, ignore_errors=True)
+    cfg = tiny_cfg(tmp_root)
+    cfg.dist_channel = True
+    cfg.dilated_backbone = True
+    trainer = Trainer(cfg)
+    summary = trainer.run()
+    assert summary["options"] >= cfg.stage1_options and summary["learn_steps"] > 0
+    import torch
+    ckpt = torch.load(os.path.join(tmp_root, "checkpoint_full_final.pt"),
+                      weights_only=False, map_location="cpu")
+    assert ckpt["agent"]["online"]["backbone.0.weight"].shape[1] == 17   # 距离通道已进网络
+    rows = _read_options_csv(tmp_root)
+    assert all(0 <= opt < 259 for opt, _, _ in rows)
+    print(f"[RF 修复冒烟] OK：{summary['options']} options（17ch + 膨胀主干）端到端通过")
+
+
 if __name__ == "__main__":
     test_stage_plan()
     test_monitor_null_and_validation()
@@ -284,4 +302,5 @@ if __name__ == "__main__":
     test_same_seed_reproducibility()
     test_mini_eval_hook_and_csv_schema()
     test_eval_suite_and_reference()
+    test_rf_fix_smoke()
     print("\n训练器/评估单测全部通过 [PASS]")

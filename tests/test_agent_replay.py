@@ -15,8 +15,8 @@ from algo.replay import ReplayBuffer
 N = 16
 
 
-def rand_tensor(rng):
-    return rng.integers(0, 3, size=(16, N, N), dtype=np.uint8)
+def rand_tensor(rng, channels=16):
+    return rng.integers(0, 3, size=(channels, N, N), dtype=np.uint8)
 
 
 def rand_mask(rng, min_legal=3):
@@ -161,6 +161,37 @@ def test_gt_directional_walls():
     print("[GT 墙线] OK：4 方向派生与规范形式逐位一致（含边框先验）")
 
 
+def test_dist_channel_agent_and_buffer():
+    """17 通道智能体端到端（2026-11-22 距离通道）：act/observe/learn 无 NaN、
+    buffer 形状随输入通道参数化；14ch 消融形状失配的潜在 bug 一并覆盖。"""
+    agent = SMDPDQNAgent(in_channels=17, capacity=2000, warmup_options=10, batch_size=8,
+                         lambda_aux=0.5, dist_channel=True, device="cpu", seed=11)
+    assert agent.buffer.s.shape[1:] == (17, N, N)          # buffer 随 in_channels 参数化
+    assert agent.buffer.s2.shape[1:] == (17, N, N)
+    scale = agent.online._chan_scale.flatten()
+    assert torch.all(scale[:16] == 0.5) and scale[16] == 1.0 / 64   # 逐通道归一
+    rng = np.random.default_rng(12)
+    ok = 0
+    for i in range(30):
+        s, s2 = rand_tensor(rng, 17), rand_tensor(rng, 17)
+        mask_b, mask_a2 = rand_mask(rng), rand_mask(rng)
+        gt_s = rng.integers(0, 2, size=(N, N), dtype=np.uint8)
+        gt_w = rng.integers(0, 2, size=(N, N), dtype=np.uint8)
+        a = agent.act(s, mask_b)                           # ε-greedy 17ch 前向
+        assert mask_b[a]
+        ok += 1
+        agent.observe(s, a=int(np.flatnonzero(mask_b)[0]), r=-2.0, s2=s2, tau=3,
+                      terminal=False, mask_b=mask_b, mask_a2=mask_a2,
+                      gt_south=gt_s, gt_west=gt_w)
+        stats = agent.maybe_learn()
+        if stats is not None:
+            assert np.isfinite(stats["td_loss"]) and np.isfinite(stats["total_loss"])
+    assert ok == 30
+    buf14 = ReplayBuffer(capacity=8, n=N, channels=14)     # 14ch 消融路径（原硬编码 16）
+    assert buf14.s.shape[1:] == (14, N, N)
+    print("[距离通道智能体] OK：17ch act/learn 无 NaN / buffer 参数化 / 归一 /64 / 14ch 形状")
+
+
 if __name__ == "__main__":
     test_replay_roundtrip()
     test_act_legal_100pct()
@@ -168,4 +199,5 @@ if __name__ == "__main__":
     test_gamma_tau_target()
     test_target_sync_and_stage_switch()
     test_gt_directional_walls()
+    test_dist_channel_agent_and_buffer()
     print("\n智能体/经验池单测全部通过 [PASS]")

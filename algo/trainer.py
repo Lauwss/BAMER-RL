@@ -84,6 +84,16 @@ class TrainConfig:
     # 出候选集 → 贪心微步环结构性消除；ε 采样池同步收窄（与§改动2合并实现，
     # 两者在掩码实现下等价）。frontier 为空（可达区域完全观测）回退全可达集。
     frontier_mask: bool = False
+    # --- 感受野修复（2026-11-22 GPT 外部批评核实，均默认关 = 旧行为） ---
+    # dist_channel：信念张量追加末通道 = BFS 距离场（belief.distance_field，账本
+    # 纯派生、R1 合法）——Q 代价项 −τ/γ^τ 的主特征在目标格自身位置 RF-1 可读，
+    # 探针实证旧栈距离仅靠局部观测密度代理（ρ(距离,优势)=−0.304，饱和失真）。
+    # 网络侧逐通道归一（距离 /64，persistent=False buffer，旧 checkpoint 兼容）。
+    dist_channel: bool = False
+    # dilated_backbone：主干 dilation 1→2→4（padding=dilation，空间 16×16 不变，
+    # 参数量不变，CUDA Graph 静态形状不变）→ 感受野 7→15——收益侧区域结构
+    # （前沿后方黑域规模）可见。探针实证旧栈 ρ(局部信息量,优势)=+0.04 ≈ 零信号。
+    dilated_backbone: bool = False
     # --- 每步管线性能等价变换（2026-11-21，逐位一致已单测验证；剖析见 CHANGELOG） ---
     lazy_replan: bool = True          # executor 账本无变化时沿缓存路径执行，跳过逐步 BFS
     scan_memo: bool = True            # belief 同 (cell,heading) 同量测的重复扫描账本标记跳过
@@ -197,15 +207,17 @@ class Trainer:
         # 种子管理（§6.1）：master seed → 环境/agent 两条独立流
         self._env_seed_rng = np.random.default_rng(int(cfg.seed) + 100)
         self.agent = SMDPDQNAgent(
-            in_channels=16 if cfg.use_traj else 14, gamma=cfg.gamma, lr=cfg.lr,
+            in_channels=14 + 2 * int(cfg.use_traj) + int(cfg.dist_channel),
+            gamma=cfg.gamma, lr=cfg.lr,
             batch_size=cfg.batch_size, target_sync_options=cfg.target_sync_options,
             warmup_options=cfg.warmup_options, lambda_aux=cfg.lambda_aux,
             grad_clip=cfg.grad_clip, eps_start=cfg.eps_start, eps_end=cfg.eps_end,
             eps_anneal_options=cfg.eps_anneal_options, capacity=cfg.capacity,
             n=self.n, aux_head=cfg.aux_head, use_gru=cfg.use_gru,
+            dist_channel=cfg.dist_channel, dilated=cfg.dilated_backbone,
             device=cfg.device, seed=int(cfg.seed), use_cuda_graph=cfg.cuda_graph)
         self.belief = BeliefState(n=self.n, max_range=cfg.lidar_max_range,
-                                  scan_memo=cfg.scan_memo)
+                                  scan_memo=cfg.scan_memo, use_dist=cfg.dist_channel)
         self.executor = Executor(self.belief, max_option_steps=cfg.env_max_steps,
                                  lazy_replan=cfg.lazy_replan)
         self.env: Optional[BamerEnv] = None

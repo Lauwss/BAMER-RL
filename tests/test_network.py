@@ -147,10 +147,62 @@ def test_aux_head_and_switches():
     print("[辅助头/开关] OK：BCE 冒烟 / use_gru 预留报错 / 14 通道消融前向")
 
 
+def test_receptive_field_dilated():
+    """膨胀主干 RF 行为测试（2026-11-22）：距中心 Chebyshev 5 的输入扰动。
+
+    默认主干 RF 7（半径 3）→ 扰动在窗外，中心格优势逐位不变（架构保证，与权重无关）；
+    dilated=True → RF 15（半径 7）→ 扰动可达中心格，优势改变。同种子初始化仅差
+    dilation 接线，权重相同。
+    """
+    torch.manual_seed(3)
+    net_a = FCQNet(in_channels=16, aux_head=False)
+    torch.manual_seed(3)
+    net_b = FCQNet(in_channels=16, aux_head=False, dilated=True)
+    x = torch.randint(0, 3, (1, 16, 16, 16), dtype=torch.uint8)
+    x2 = x.clone()
+    x2[0, 0, 8, 13] = (int(x[0, 0, 8, 13]) + 1) % 3       # 距中心 (8,8) Chebyshev 5
+    center = 8 * 16 + 8                                    # explore_index((8,8)) = y*16+x
+    with torch.no_grad():
+        a1 = net_a(x)["advantage"][0, center]
+        a2 = net_a(x2)["advantage"][0, center]
+        b1 = net_b(x)["advantage"][0, center]
+        b2 = net_b(x2)["advantage"][0, center]
+    assert torch.equal(a1, a2), "默认 RF 7 不应受 Chebyshev 5 处扰动影响"
+    assert not torch.equal(b1, b2), "膨胀 RF 15 应受 Chebyshev 5 处扰动影响"
+    print("[膨胀感受野] OK：默认中心逐位不变 / 膨胀中心响应（RF 7→15）")
+
+
+def test_dist_channel_forward_and_scale():
+    """17 通道前向 + 逐通道归一语义：距离通道 /64、类别通道 /2；默认路径逐位回归。
+
+    逐位回归：16ch 网络的 explore 分支输出 == 旧公式手工复算
+    （x.float()/2.0 过同权重主干 → 1×1 head）——chan_scale 重构（x·0.5）与
+    旧 x/2.0 在 IEEE 754 下逐元素恒等。
+    """
+    torch.manual_seed(4)
+    net = FCQNet(in_channels=17, aux_head=True, dist_channel=True)
+    x = torch.randint(0, 255, (2, 17, 16, 16), dtype=torch.uint8)
+    out = net(x)
+    assert out["advantage"].shape == (2, N_OPTIONS)
+    scale = net._chan_scale
+    assert torch.all(scale[:, :16] == 0.5) and scale[0, 16, 0, 0] == 1.0 / 64
+    torch.manual_seed(5)
+    net16 = FCQNet(in_channels=16, aux_head=False)
+    x16 = torch.randint(0, 3, (1, 16, 16, 16), dtype=torch.uint8)
+    with torch.no_grad():
+        got = net16(x16)["advantage"][:, :256]            # explore 分支前 256 维
+        feat = net16.backbone(x16.float() / 2.0)
+        ref = net16.explore_head(feat).flatten(1)
+    assert torch.equal(got, ref), "默认归一路径与旧 x/2.0 公式输出不一致"
+    print("[距离通道前向] OK：17ch 形状 / 归一 /64 / 默认路径逐位一致")
+
+
 if __name__ == "__main__":
     test_forward_shapes()
     test_dueling_mask_semantics()
     test_scenes_argmax_respects_mask()
     test_masked_argmax_fuzz()
     test_aux_head_and_switches()
+    test_receptive_field_dilated()
+    test_dist_channel_forward_and_scale()
     print("\n网络单测全部通过 [PASS]")
