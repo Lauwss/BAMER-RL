@@ -33,11 +33,15 @@ class FCQNet(nn.Module):
     - dist_channel：末通道 = BFS 距离场（序数量，账本派生）→ 逐通道输入归一
       （距离 /64，类别通道 /2），距离量级与类别通道同族，避免 init 方差失衡；
     - dilated_backbone：主干 dilation 1→2→4（padding=dilation，空间恒 16×16），
-      感受野 7→15（每层 k_eff = 3+2(d−1)，r ← r + (k_eff−1)·j），参数量不变。
+      感受野 7→15（每层 k_eff = 3+2(d−1)，r ← r + (k_eff−1)·j），参数量不变；
+    - dir_channel：方向对齐度场（序数量，边界历史派生）→ 归一 /255。连续尾部
+      通道布局恒 dist 在前、align 末位，chan_scale 按门控组合定位（类别通道
+      保持 /2，旧组合逐位不变）。
     """
 
     def __init__(self, in_channels: int = 16, aux_head: bool = True, use_gru: bool = False,
-                 dist_channel: bool = False, dilated: bool = False):
+                 dist_channel: bool = False, dilated: bool = False,
+                 dir_channel: bool = False):
         super().__init__()
         if use_gru:
             raise NotImplementedError(
@@ -58,8 +62,12 @@ class FCQNet(nn.Module):
         # 随 .to(device) 迁移）。类别通道 /2（旧路径 x/2.0 与 x·0.5 逐元素 IEEE 恒等 →
         # 默认路径逐位不变）；距离通道为序数量（0..DIST_CAP=64），/64 归一到 [0,1]。
         chan_scale = torch.full((1, self.in_channels, 1, 1), 0.5)
+        # 连续尾部通道（布局：…[dist?][align?]，align 恒居末位）：距离 /64、对齐度
+        # /255 归一到 [0,1]；类别通道维持 /2。旧组合（无 dir）定位不变 → 逐位兼容。
         if dist_channel:
-            chan_scale[0, -1, 0, 0] = 1.0 / 64.0
+            chan_scale[0, -1 - int(dir_channel), 0, 0] = 1.0 / 64.0
+        if dir_channel:
+            chan_scale[0, -1, 0, 0] = 1.0 / 255.0
         self.register_buffer("_chan_scale", chan_scale, persistent=False)
         self.explore_head = nn.Conv2d(64, 1, kernel_size=1)          # A_explore (1,16,16)
         self.pick_head = nn.Linear(64, 2)                            # A_pick (2)

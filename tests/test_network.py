@@ -197,6 +197,31 @@ def test_dist_channel_forward_and_scale():
     print("[距离通道前向] OK：17ch 形状 / 归一 /64 / 默认路径逐位一致")
 
 
+def test_dir_channel_forward_and_scale():
+    """对齐度通道前向 + chan_scale 尾部定位：align 恒末位 /255；dist+dir 时 dist@−2。
+
+    1/255 非二进制精确数 → 容差断言；1/64（2⁻⁶）精确。默认组合（无 dir）逐位
+    不变；_chan_scale persistent=False → 旧 checkpoint state_dict 严格兼容。
+    """
+    torch.manual_seed(6)
+    net = FCQNet(in_channels=17, aux_head=True, dir_channel=True)
+    x = torch.randint(0, 255, (2, 17, 16, 16), dtype=torch.uint8)
+    out = net(x)
+    assert out["advantage"].shape == (2, N_OPTIONS)
+    scale = net._chan_scale
+    assert torch.all(scale[:, :16] == 0.5)
+    assert abs(float(scale[0, 16, 0, 0]) - 1.0 / 255) < 1e-6   # align 恒末位
+    net_da = FCQNet(in_channels=18, aux_head=True, dist_channel=True, dir_channel=True)
+    assert abs(float(net_da._chan_scale[0, 17, 0, 0]) - 1.0 / 255) < 1e-6
+    assert float(net_da._chan_scale[0, 16, 0, 0]) == 1.0 / 64  # dist@−2（布局稳定）
+    with torch.no_grad():
+        assert net_da(torch.zeros((1, 18, 16, 16), dtype=torch.uint8))["advantage"].shape == (1, N_OPTIONS)
+    net16 = FCQNet(in_channels=16)
+    assert torch.all(net16._chan_scale == 0.5)                 # 默认路径逐位不变
+    assert not any("_chan_scale" in k for k in net16.state_dict())
+    print("[对齐通道前向] OK：17/18ch 形状 / chan_scale 尾部定位 / 默认逐位不变 / state_dict 兼容")
+
+
 if __name__ == "__main__":
     test_forward_shapes()
     test_dueling_mask_semantics()
@@ -205,4 +230,5 @@ if __name__ == "__main__":
     test_aux_head_and_switches()
     test_receptive_field_dilated()
     test_dist_channel_forward_and_scale()
+    test_dir_channel_forward_and_scale()
     print("\n网络单测全部通过 [PASS]")

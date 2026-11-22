@@ -292,6 +292,57 @@ def test_rf_fix_smoke(tmp_root="algo/runs/_test_rf_fix"):
     print(f"[RF 修复冒烟] OK：{summary['options']} options（17ch + 膨胀主干）端到端通过")
 
 
+def test_dir_channel_smoke(tmp_root="algo/runs/_test_dir_fix"):
+    """方向对齐度通道端到端冒烟（2026-11-22 方向连续性特征）：dir_channel 单开小预算训练。
+
+    归因臂配置 = frontier 基线 + dir（无 dist）→ in_channels 17；训练/评估/学习
+    全链路走通 + checkpoint 通道数校验。
+    """
+    shutil.rmtree(tmp_root, ignore_errors=True)
+    cfg = tiny_cfg(tmp_root)
+    cfg.dir_channel = True
+    trainer = Trainer(cfg)
+    summary = trainer.run()
+    assert summary["options"] >= cfg.stage1_options and summary["learn_steps"] > 0
+    import torch
+    ckpt = torch.load(os.path.join(tmp_root, "checkpoint_full_final.pt"),
+                      weights_only=False, map_location="cpu")
+    assert ckpt["agent"]["online"]["backbone.0.weight"].shape[1] == 17   # 对齐通道已进网络
+    rows = _read_options_csv(tmp_root)
+    assert all(0 <= opt < 259 for opt, _, _ in rows)
+    print(f"[对齐通道冒烟] OK：{summary['options']} options（17ch dir-only）端到端通过")
+
+
+def test_reward_delivery_scale():
+    """送达奖励尺度门控（2026-11-22 消融）：默认 300 = 归档逐位不变；600/1000 线性缩放。
+
+    _milestones 对 Arrived 事件按 cfg.reward_delivery 计 bonus；识别/终点里程碑
+    (+100) 不受影响；_reward_search 的阶段 0 扣除同步使用同值。
+    """
+    from types import SimpleNamespace
+
+    def trainer_with(scale):
+        cfg = TrainConfig(arm="C", reward_delivery=scale)
+        return Trainer(cfg)
+
+    events = [
+        SimpleNamespace(type="Arrived", payload={}),
+        SimpleNamespace(type="Arrived", payload={}),
+        SimpleNamespace(type="ImageFeed", payload={"first": True}),
+    ]
+    for scale in (300.0, 600.0, 1000.0):
+        t = trainer_with(scale)
+        bonus, counts = t._milestones(events)
+        assert bonus == scale * 2 + 100.0, (scale, bonus)
+        assert counts == {"identify": 1, "destination": 0, "deliver": 2}
+        # 阶段 0 搜索奖励的送达扣除同步
+        result = SimpleNamespace(events=events, steps=10)
+        r = t._reward_search(result, 0, 0)
+        assert r == -10.0 + 100.0, (scale, r)          # 送达分量被完整扣除
+    assert TrainConfig(arm="C").reward_delivery == 300.0   # 默认 = 归档契约行为
+    print("[送达奖励尺度] OK：300 默认逐位不变 / 600、1000 线性缩放 / search 扣除同步")
+
+
 if __name__ == "__main__":
     test_stage_plan()
     test_monitor_null_and_validation()
@@ -303,4 +354,6 @@ if __name__ == "__main__":
     test_mini_eval_hook_and_csv_schema()
     test_eval_suite_and_reference()
     test_rf_fix_smoke()
+    test_dir_channel_smoke()
+    test_reward_delivery_scale()
     print("\n训练器/评估单测全部通过 [PASS]")

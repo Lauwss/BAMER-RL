@@ -59,6 +59,7 @@ class SMDPDQNAgent:
                  eps_anneal_options: int = 20000, capacity: int = 100_000,
                  n: int = 16, aux_head: bool = True, use_gru: bool = False,
                  dist_channel: bool = False, dilated: bool = False,
+                 dir_channel: bool = False,
                  device: Optional[str] = None, seed: int = 0,
                  use_cuda_graph: bool = False):
         self.device = torch.device(device) if device else torch.device(
@@ -72,9 +73,11 @@ class SMDPDQNAgent:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
         self.online = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru,
-                             dist_channel=dist_channel, dilated=dilated).to(self.device)
+                             dist_channel=dist_channel, dilated=dilated,
+                             dir_channel=dir_channel).to(self.device)
         self.target = FCQNet(in_channels=in_channels, aux_head=aux_head, use_gru=use_gru,
-                             dist_channel=dist_channel, dilated=dilated).to(self.device)
+                             dist_channel=dist_channel, dilated=dilated,
+                             dir_channel=dir_channel).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         for p in self.target.parameters():
             p.requires_grad_(False)
