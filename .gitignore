@@ -5,3 +5,6 @@ __pycache__/
 
 # 训练产物（checkpoint/日志不入库，路径由配置指定）
 algo/runs/
+
+# swanlab 本地缓存（云端模式下为上报记录副本）
+swanlog/
