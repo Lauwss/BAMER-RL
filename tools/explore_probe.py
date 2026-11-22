@@ -11,12 +11,16 @@
   选中=最近比例 / 选中距离秩(0=最近) —— 代价侧近偏形态
   Spearman(距离, 优势)                —— 代价侧：代理(旧栈 −0.304) vs 精确(距离通道)
   Spearman(局部未知槽, 优势)          —— 收益侧：旧栈 +0.04 ≈ 零信号，膨胀主干预期转正
+  Spearman(对齐度, 优势)              —— 方向连续性预检 L1（2026-11-22）：a(c)=cos∠(c−P, P−B)，
+                                        打分是否表达"候选在我来路方向"；≈0 = 排序信号真空，
+                                        方向特征前提成立；显著正 = 前提死（特征计划叫停）
 
 用法：
     python tools/explore_probe.py --run-dir algo/runs/armA_frontier_dist [--seeds 30]
                                   [--checkpoint checkpoint_stage1_final.pt]
 """
 import argparse
+import math
 import os
 import sys
 from collections import deque
@@ -49,15 +53,18 @@ def rankcorr(a: np.ndarray, b: np.ndarray) -> float:
 def run_probe(cfg: TrainConfig, checkpoint: str, seeds) -> None:
     torch.manual_seed(int(cfg.seed))
     ckpt = torch.load(checkpoint, weights_only=False, map_location="cpu")
-    agent = SMDPDQNAgent(in_channels=14 + 2 * int(cfg.use_traj) + int(cfg.dist_channel),
+    agent = SMDPDQNAgent(in_channels=14 + 2 * int(cfg.use_traj) + int(cfg.dist_channel)
+                         + int(cfg.dir_channel),
                          n=cfg.maze_n, aux_head=cfg.aux_head,
                          dist_channel=cfg.dist_channel, dilated=cfg.dilated_backbone,
+                         dir_channel=cfg.dir_channel,
                          device="cpu", seed=cfg.seed)
     agent.load_state_dict(ckpt["agent"])
     net = agent.online
 
     belief = BeliefState(n=cfg.maze_n, max_range=cfg.lidar_max_range,
-                         scan_memo=cfg.scan_memo, use_dist=cfg.dist_channel)
+                         scan_memo=cfg.scan_memo, use_dist=cfg.dist_channel,
+                         use_dir=cfg.dir_channel)
     executor = Executor(belief, max_option_steps=cfg.env_max_steps, lazy_replan=cfg.lazy_replan)
 
     def factory():
@@ -73,7 +80,8 @@ def run_probe(cfg: TrainConfig, checkpoint: str, seeds) -> None:
         return sum(1 for d in HEADINGS
                    if belief.ledger.wall_value(cell[0], cell[1], d) == W_UNKNOWN)
 
-    rows = []          # (d_chosen, d_min, d_mean, rank_norm, ρ(距离,优势), ρ(局部,优势), n_front)
+    rows = []          # (d_chosen, d_min, d_mean, rank_norm, ρ(距离,优势), ρ(局部,优势), n_front,
+                       #  ρ(对齐度,优势), 搜索期)
     n_options = n_explore = 0
     for seed in seeds:
         env = factory()
@@ -97,11 +105,28 @@ def run_probe(cfg: TrainConfig, checkpoint: str, seeds) -> None:
                 ds = np.array([dist[c] for c in front], dtype=float)
                 avs = np.array([adv[a] for a in front_idx])
                 loc = np.array([unknown_slots(c) for c in front], dtype=float)
+                # 对齐度（方向连续性预检 L1）：a(c)=cos∠(c−P, P−B)。B=上个决策边界格
+                # （commit_option 登记，belief.prev_boundary_cell）；首边界/零位移 option
+                # → 整列 nan（报告期过滤）。frontier 掩码排除自身格，dn>0 恒成立。
+                ali = np.full(len(front), np.nan)
+                if belief.prev_boundary_cell is not None:
+                    vx = belief.cell[0] - belief.prev_boundary_cell[0]
+                    vy = belief.cell[1] - belief.prev_boundary_cell[1]
+                    if vx != 0 or vy != 0:
+                        vn = math.hypot(vx, vy)
+                        for i, (cx, cy) in enumerate(front):
+                            dx, dy = cx - belief.cell[0], cy - belief.cell[1]
+                            dn = math.hypot(dx, dy)
+                            if dn > 0:
+                                ali[i] = (dx * vx + dy * vy) / (dn * vn)
                 if len(front) > 1 and (ds > -1).all():
                     d_chosen = int(dist[index_cell(action, n)])
                     rank = float((ds < d_chosen).sum()) / (len(ds) - 1)   # 0=最近（并列偏保守）
+                    ali_rc = rankcorr(ali, avs) if np.isfinite(ali).all() else float("nan")
+                    search = 0 if belief.poi_complete() else 1            # 搜索期=POI 未齐
                     rows.append((d_chosen, float(ds.min()), float(ds.mean()), rank,
-                                 rankcorr(ds, avs), rankcorr(loc, avs), len(front)))
+                                 rankcorr(ds, avs), rankcorr(loc, avs), len(front),
+                                 ali_rc, search))
             result = executor.run(env, action)
             belief.commit_option(result.path, result.start_cell)
             if result.steps == 0:
@@ -126,6 +151,12 @@ def run_probe(cfg: TrainConfig, checkpoint: str, seeds) -> None:
     cl = arr[:, 5][~np.isnan(arr[:, 5])]
     print(f"  逐 option Spearman(距离, 优势)       : 均值 {np.nanmean(cd):+.3f}（n={len(cd)}/{len(arr)}）")
     print(f"  逐 option Spearman(局部未知槽, 优势) : 均值 {np.nanmean(cl):+.3f}（n={len(cl)}/{len(arr)}）")
+    ok_a = ~np.isnan(arr[:, 7])
+    ca = arr[ok_a, 7]
+    cs = arr[ok_a & (arr[:, 8] == 1), 7]
+    cs_txt = f"{np.nanmean(cs):+.3f}（n={len(cs)}）" if len(cs) else "—（无样本）"
+    print(f"  逐 option Spearman(对齐度, 优势)     : 均值 {np.nanmean(ca):+.3f}（n={len(ca)}/{len(arr)}；"
+          f"搜索期 {cs_txt}）")
     d = arr[:, 0]
     print(f"  选中距离分布: p25={np.percentile(d, 25):.0f} 中位={np.median(d):.0f} "
           f"p75={np.percentile(d, 75):.0f} max={d.max():.0f}")

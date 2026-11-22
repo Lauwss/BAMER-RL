@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """执行器单测（§8 冒烟 2）：已知图最短路解析解对拍（含转向计步）；重规划/中止用例；Pick/Deliver option 全流程。"""
 import os
 import sys
@@ -6,8 +6,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from algo.actions import IDX_DELIVER, IDX_PICK, N_EXPLORE, explore_index, legal_mask
-from algo.belief import BeliefState
-from algo.executor import Executor, bfs_path
+from algo.belief import W_FREE, W_WALL, BeliefState
+from algo.executor import Executor, bfs_path, bfs_path_weighted
 from bamer_env import BamerEnv, Maze
 from bamer_mouse.lidar import LidarSpec
 
@@ -242,6 +242,106 @@ def test_executor_step_accounting():
     print("[步数记账] OK：option 步数与 env 计步一致（含转向原语）")
 
 
+def _belief_two_routes(n=7):
+    """手工信念（槽位共享已仔细核算）：起点 (0,0)E → 目标 (6,0)。
+
+    直走廊 y=0：6 F 全扫过（gain 全 0）→ λ=0.8 代价 6.0；
+    绕行走廊 y=1：TL F TR F×6 TR F = 11 原语（3 转向 + 8 移动），
+      (0..6,1) 各 gain 1（N 槽未知）→ λ=0.8 代价 3 + 8×0.2 = 4.6 < 6.0
+      → 绕行收割获胜。
+    λ=0：直走廊 6 原语最短。两走廊间 y=1 行以南边界全标 WALL（槽位共享
+    不给直走廊送 gain）；竖井 (0,1)/(6,1) 通道共享槽如实计入双方。
+    """
+    b = BeliefState(n=n)
+    b.cell = (0, 0)
+    b.heading = "E"
+    led = b.ledger
+    for x in range(1, 7):
+        led._mark(led.sensed_west, x, 0, W_FREE)      # 直走廊通道
+        led._mark(led.sensed_west, x, 1, W_FREE)      # 绕行走廊通道
+    for x in range(0, 7):
+        led._mark(led.sensed_south, x, 0, W_WALL)     # 底行南界（已扫）
+        if 1 <= x <= 5:
+            led._mark(led.sensed_south, x, 1, W_WALL)  # 走廊间隔墙（已扫）
+    led._mark(led.sensed_south, 0, 1, W_FREE)          # 入口竖井 (0,0)-(0,1)
+    led._mark(led.sensed_south, 6, 1, W_FREE)          # 出口竖井 (6,1)-(6,0)
+    led._mark(led.sensed_west, 0, 0, W_WALL)           # 西边框（已扫）
+    led._mark(led.sensed_west, 0, 1, W_WALL)
+    return b
+
+
+def _prims_to_cells(start, start_heading, prims):
+    """原语序列 → 到访格序列（测试断言用；不含碰撞语义——全部边界已探明）。"""
+    from algo.belief import HEADINGS
+    from bamer_env.maze import DIRS
+    cells = [start]
+    h = HEADINGS.index(start_heading)
+    x, y = start
+    for p in prims:
+        if p == "F":
+            dx, dy = DIRS[HEADINGS[h]]
+            x, y = x + dx, y + dy
+        else:
+            h = (h + {"TL": -1, "TR": 1, "TB": 2}[p]) % 4
+        cells.append((x, y))
+    return cells
+
+
+def test_weighted_path_handcheck():
+    """信息加权寻路（2026-11-22 P1）：λ=0 取最短；λ=0.8 绕行收割未扫槽获胜。"""
+    b = _belief_two_routes()
+    g = Executor(b, path_gain_lambda=0.8)._gain_array()
+    # gain 手算对拍：绕行走廊 (0..6,1) 各 gain 1（N 槽未知）；直走廊 (0..6,0) 全 0
+    # （(6,0) 的 N 槽 = 出口竖井 FREE 已知，不计 gain）
+    for x in range(7):
+        assert g[x, 1] == 1, f"({x},1) gain={g[x, 1]}"
+        assert g[x, 0] == 0, f"({x},0) gain={g[x, 0]}"
+
+    ex0 = Executor(b, path_gain_lambda=0.0)
+    p0 = ex0.plan((6, 0))
+    assert p0 == ["F"] * 6, p0                              # λ=0：直走廊最短
+
+    ex7 = Executor(b, path_gain_lambda=0.8)
+    p1 = ex7.plan((6, 0))
+    assert len(p1) == 11, p1                                # 多 5 原语但信息折现划算
+    cells = _prims_to_cells((0, 0), "E", p1)
+    assert any(y == 1 for (_, y) in cells)                  # 走了绕行走廊
+    assert cells[-1] == (6, 0)
+    # 手算代价：直 6×1.0=6.0；绕 3 转向 + 8×max(0.1,1−0.8)=3+8×0.2=4.6 < 6.0
+    # 确定性：同快照重规划逐位一致
+    assert ex7.plan((6, 0)) == p1
+    # λ=0 加权函数退化为步数最短（长度等价）
+    p2 = bfs_path_weighted(7, (0, 0), "E", (6, 0), b.open_boundary,
+                           g, 0.0)
+    assert len(p2) == 6
+    # 步数单调：加权路径步数 ≥ 无权最短（边权 ≤ 1 的推论）
+    assert len(p1) >= len(p0)
+    print("[加权寻路] OK：λ=0 直走廊 / λ=0.8 绕行收割（4.6<6.0 手算）/ 确定性 / 步数单调")
+
+
+def test_weighted_executor_episode_smoke():
+    """真环境冒烟：λ=0.5 执行器 Explore 正常（可达目标成功 / 远目标不可达中止）。"""
+    maze = empty_maze(5)
+    env = _scan_env(maze, {"quyuan": (0, 2), "zhaojun": (3, 1)},
+                    {"chuguo": (0, 4), "xihan": (1, 3)}, 5)
+    obs, info = env.reset(seed=0)
+    belief = BeliefState(n=5)
+    belief.observe(obs, info)
+    ex = Executor(belief, max_option_steps=200, path_gain_lambda=0.5)
+    # reset 后可达集内目标（range-2 扫描揭示的范围）：贪心收割路径正常执行
+    for target in [(1, 0), (2, 0), (1, 1), (0, 1)]:
+        idx = explore_index(target, 5)
+        r = ex.run(env, idx)
+        assert r.success and not r.aborted, f"target={target}: {r}"
+        assert r.steps >= 1
+        belief.commit_option(r.path, r.start_cell)
+        print(f"  target={target} steps={r.steps} success={r.success}")
+    # 可达集外目标：悲观约定 → 不可达中止（失败信号交还高层，与 λ 无关）
+    r_far = ex.run(env, explore_index((4, 4), 5))
+    assert r_far.aborted and r_far.steps == 0
+    print("[加权执行器冒烟] OK：λ=0.5 可达目标正常 / 远目标不可达中止（设计语义）")
+
+
 if __name__ == "__main__":
     test_bfs_turn_counting()
     test_bfs_detour()
@@ -250,4 +350,6 @@ if __name__ == "__main__":
     test_executor_abort_mid_option()
     test_executor_pick_and_deliver_flow()
     test_executor_step_accounting()
+    test_weighted_path_handcheck()
+    test_weighted_executor_episode_smoke()
     print("\n执行器单测全部通过 [PASS]")

@@ -22,12 +22,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import heapq
+
 import numpy as np
 
 from bamer_env.maze import DIRS
 
 from .actions import option_target
-from .belief import HEADINGS, BeliefState
+from .belief import HEADINGS, W_UNKNOWN, BeliefState
 
 # 朝向转移：TL/TR/TB 作用在 HEADINGS 下标上（模 4），每个旋转原语计 1 步（R4）
 _TURN = {"TL": -1, "TR": +1, "TB": +2}
@@ -69,6 +71,53 @@ def bfs_path(n: int, start_cell: Cell, start_heading: str, target: Cell,
     return None
 
 
+def bfs_path_weighted(n: int, start_cell: Cell, start_heading: str, target: Cell,
+                      open_fn, gain, lam: float) -> Optional[List[str]]:
+    """(格,朝向) 加权最短路（Dijkstra，2026-11-22 搜索效率修复 P1）。
+
+    移动边 cost = max(0.1, 1 − λ·gain(进入格))，旋转边 cost = 1——路径代价
+    = 步数 − 沿途信息收益折现，"顺路收割"未扫格。gain = 计划时账本快照的
+    逐格未揭示邻接槽位数（0~4；规划期间账本不变，一次预计算查表）。非负
+    托底 0.1 保证 Dijkstra 有效（哪怕信息赚翻，一步至少值一步）。λ=0 恒等
+    退化为步数最短路（executor.plan 门控，λ=0 走原 bfs_path 逐位不变）。
+    确定性 tie-break：(cost, 插入序) 二级键 + _TURN 固定顺序。
+    """
+    h0 = HEADINGS.index(start_heading)
+    if start_cell == target:
+        return []
+    start = (start_cell[0], start_cell[1], h0)
+    best = {start: 0.0}
+    prev = {start: None}
+    counter = 0
+    heap = [(0.0, counter, start)]
+    while heap:
+        cost, _, st = heapq.heappop(heap)
+        if cost > best.get(st, float("inf")):
+            continue                                    # 过期堆项（已找到更优）
+        x, y, h = st
+        if (x, y) == target:                            # 弹出即最优（非负权 Dijkstra）
+            return _reconstruct(prev, st)
+        d = HEADINGS[h]
+        dx, dy = DIRS[d]
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < n and 0 <= ny < n and open_fn((x, y), d):
+            ns = (nx, ny, h)
+            nc = cost + max(0.1, 1.0 - lam * float(gain[nx, ny]))
+            if nc < best.get(ns, float("inf")):
+                best[ns] = nc
+                prev[ns] = (st, "F")
+                counter += 1
+                heapq.heappush(heap, (nc, counter, ns))
+        for prim, dh in _TURN.items():
+            ns = (x, y, (h + dh) % 4)
+            if cost + 1.0 < best.get(ns, float("inf")):
+                best[ns] = cost + 1.0
+                prev[ns] = (st, prim)
+                counter += 1
+                heapq.heappush(heap, (cost + 1.0, counter, ns))
+    return None
+
+
 def _reconstruct(prev: dict, state: Tuple[int, int, int]) -> List[str]:
     prims = []
     cur = state
@@ -100,18 +149,23 @@ class Executor:
     """option 执行器：持有一个 BeliefState，驱动 BamerEnv 直到 option 终止。"""
 
     def __init__(self, belief: BeliefState, max_option_steps: int = 512,
-                 lazy_replan: bool = True):
+                 lazy_replan: bool = True, path_gain_lambda: float = 0.0):
         self.belief = belief
         self.max_option_steps = int(max_option_steps)
         # 按需重规划（2026-11-21 性能等价变换）：账本自上次规划后无变化时，确定性
         # BFS 从当前 (cell,heading) 必然给出缓存路径的剩余后缀 → 直接沿缓存执行，
         # 跳过逐步 BFS。等价性：BFS/运动学均确定性，路径后缀 = 现状重规划结果。
         # 账本逐帧比对（脏检测）保证任何新墙揭示即刻触发重规划，语义不变。
+        # λ>0 时路径 = 账本快照的确定函数不变（gain 亦为账本纯函数）→ 等价性保持。
         self.lazy_replan = bool(lazy_replan)
+        # 信息加权寻路（2026-11-22 搜索效率修复 P1）：λ>0 时移动边权
+        # max(0.1, 1 − λ·gain(进入格))，路径顺路收割未扫格。默认 0 = 步数最短路
+        # （逐位不变）。gain 为账本纯函数 → lazy_replan 等价性不受影响。
+        self.path_gain_lambda = float(path_gain_lambda)
 
     # ---------- 规划 ----------
     def plan(self, target: Cell) -> Optional[List[str]]:
-        """在最新信念图上规划到 target 的原语序列（1024 态 BFS）。
+        """在最新信念图上规划到 target 的原语序列（1024 态搜索）。
 
         实测注记（2026-11-20）：曾试做 numpy 前沿扩展版，微基准 0.85ms vs 标量
         0.56ms（0.7×，更慢）——标量版提前终止只访问路径半径内 ~150 态，而逐层
@@ -119,7 +173,29 @@ class Executor:
         短路占优时标量更快。负结果详见 CHANGELOG，勿再重复此优化方向。
         """
         b = self.belief
+        if self.path_gain_lambda > 0.0:
+            gain = self._gain_array()
+            return bfs_path_weighted(b.n, b.cell, b.heading, target,
+                                     b.open_boundary, gain, self.path_gain_lambda)
         return bfs_path(b.n, b.cell, b.heading, target, b.open_boundary)
+
+    def _gain_array(self) -> np.ndarray:
+        """逐格未揭示邻接槽位数（账本纯函数；256 格 × 4 槽查表，µs 级）。
+
+        语义 = "站在该格，本次扫描将揭示的 own 槽位数"（雷达 2.0 量程内更远
+        槽位的收益未计入——v1 取最直接的主项，避免对角几何的模糊归属）。
+        """
+        b = self.belief
+        led = b.ledger
+        g = np.zeros((b.n, b.n), dtype=np.float32)
+        for x in range(b.n):
+            for y in range(b.n):
+                c = 0
+                for d in HEADINGS:
+                    if led.wall_value(x, y, d) == W_UNKNOWN:
+                        c += 1
+                g[x, y] = c
+        return g
 
     # ---------- 执行 ----------
     def run(self, env, option_idx: int) -> OptionResult:

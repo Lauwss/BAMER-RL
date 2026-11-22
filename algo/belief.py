@@ -67,6 +67,16 @@ CH_DIST = 16
 N_CHANNELS_DIST = 17
 DIST_CAP = 64                   # 4× 边长；蛇形长廊实测 ≤57（30-seed 探针）
 
+# --- 方向对齐度通道（2026-11-22 方向连续性特征，门控 BeliefState(use_dir)） ---
+# 每格存"该格相对当前格的方向与上个 option 净位移向量 v = cell − prev_boundary_cell
+# 的 cos 夹角"（序数量）：+1 正前（延续扫掠）→ −1 完全回头（来路方位）。
+# uint8 = round((cos+1)·127)+1（cos=1→255，0→128，−1→1）；0 = 未定义（episode
+# 首边界 / 零位移 option / 当前格自身），遵守全零=未知约定。与距离通道同款 trick：
+# "候选是否在来路方向"这一成对量预计算写在候选格自身位置上 → explore head 感受野
+# 1 即可读（prev_boundary 锚点单像素 RF 外不可见，cos 场是其可用替代形式）。
+CH_ALIGN = 17
+N_CHANNELS_ALIGN = 18
+
 POI_CHANNELS = {"quyuan": CH_POI_QUYUAN, "zhaojun": CH_POI_ZHAOJUN}
 DEST_CHANNELS = {"chuguo": CH_POI_CHUGUO, "xihan": CH_POI_XIHAN}
 CARRY_CHANNELS = {"quyuan": CH_CARRY_QUYUAN, "zhaojun": CH_CARRY_ZHAOJUN}
@@ -303,13 +313,17 @@ class BeliefState:
     """
 
     def __init__(self, n: int = 16, classifier: Optional[IdentityClassifier] = None,
-                 max_range: float = 2.0, scan_memo: bool = True, use_dist: bool = False):
+                 max_range: float = 2.0, scan_memo: bool = True, use_dist: bool = False,
+                 use_dir: bool = False):
         self.n = int(n)
         self.classifier = classifier if classifier is not None else GTAssetClassifier()
         self.max_range = float(max_range)
         self.ledger = SensingLedger(self.n)
         # 距离通道门控（2026-11-22）：True 时 tensor() 返回 (17,n,n)，末通道 = BFS 距离场
         self.use_dist = bool(use_dist)
+        # 方向对齐度通道门控（2026-11-22 方向连续性特征）：True 时 tensor() 追加
+        # 末通道 = cos 对齐度场。与 dist 同为连续尾部通道，布局恒 dist 在前、align 末位。
+        self.use_dir = bool(use_dir)
         # 事件簿记（全部来自合法通道；识别身份经分类器，见模块 docstring）
         self.machine_known: Dict[str, Cell] = {}    # 已识别机器 → 识别位置（当步自身格）
         self.machine_delivered: Set[str] = set()
@@ -448,15 +462,51 @@ class BeliefState:
                     dq.append((nx, ny))
         return dist
 
+    def alignment_field(self) -> np.ndarray:
+        """方向对齐度场（2026-11-22 方向连续性特征的派生源；边界历史纯派生、无写入路径）。
+
+        参考向量 v = cell − prev_boundary_cell（上个 option 的净位移方向，option
+        结束时 cell 恰为 path 末端，零新增状态）。逐格 a(c) = cos∠(c − cell, v)：
+        +1 = 正前（延续扫掠），−1 = 完全回头（来路方位）。"候选是否在我来路方向"
+        这一成对量预计算写在候选格自身位置上——走廊/锚点证据虽在输入（轨迹双通道），
+        但与远处候选的比较受 RF 限制不可达，此处绕开（与距离通道同一动机）。
+
+        编码 uint8：round((cos+1)·127)+1（+1→255，0→128，−1→1）；0 = 未定义
+        （episode 首边界 / 零位移 option / 当前格自身——无方向语义），遵守全零=
+        未知约定。含不可达格（合法掩码恒排除，场本身无害）。每决策边界调用一次
+        （256 格循环，µs 级，同 distance_field 量级）。
+        """
+        n = self.n
+        f = np.zeros((n, n), dtype=np.uint8)
+        if self.prev_boundary_cell is None:
+            return f                    # episode 首边界：全零 = 未知约定
+        vx = self.cell[0] - self.prev_boundary_cell[0]
+        vy = self.cell[1] - self.prev_boundary_cell[1]
+        vnorm = math.hypot(vx, vy)
+        if vnorm == 0.0:
+            return f                    # 零位移 option（含到位型 Pick）：无方向语义
+        px, py = self.cell
+        for x in range(n):
+            for y in range(n):
+                dx, dy = x - px, y - py
+                if dx == 0 and dy == 0:
+                    continue            # 当前格自身：无方向语义 → 0（未知）
+                c = (dx * vx + dy * vy) / (math.hypot(dx, dy) * vnorm)
+                f[x, y] = int(round((c + 1.0) * 127.0)) + 1
+        return f
+
     # ---------- 16 通道信念张量派生 ----------
     def tensor(self, use_traj: bool = True) -> np.ndarray:
         """由账本一次性重建信念张量（§2.1 定稿；无写入路径，每次全量派生）。
 
-        返回 (16,16,16) uint8（use_traj=False 时 (14,16,16)；构造 use_dist=True 时
-        追加 CH_DIST 距离通道 → (17,16,16) / (15,16,16)）；布局 [C, x, y]。
+        返回 (16,16,16) uint8；use_traj=False 裁至 14 基础通道；use_dist/use_dir
+        依次追加连续尾部通道（dist 在前、align 恒居末位，与 network.chan_scale
+        的尾部定位对齐）→ 全家福 (18,16,16)。布局 [C, x, y]。
         """
         n = self.n
-        c_total = N_CHANNELS_DIST if self.use_dist else N_CHANNELS
+        ch_dist = N_CHANNELS if self.use_dist else None                    # 16
+        ch_align = (N_CHANNELS + int(self.use_dist)) if self.use_dir else None
+        c_total = N_CHANNELS + int(self.use_dist) + int(self.use_dir)
         T = np.zeros((c_total, n, n), dtype=np.uint8)
         south, west = self.ledger.sensed_south, self.ledger.sensed_west
 
@@ -494,7 +544,11 @@ class BeliefState:
 
         # --- 距离通道（2026-11-22 感受野修复§改动1：Q 代价项主特征，账本纯派生） ---
         if self.use_dist:
-            T[CH_DIST] = self.distance_field()
+            T[ch_dist] = self.distance_field()
+
+        # --- 方向对齐度通道（2026-11-22 方向连续性特征：排序回头成本，边界历史纯派生） ---
+        if self.use_dir:
+            T[ch_align] = self.alignment_field()
 
         # --- 轨迹双通道（新近性上下文；episode 首边界全零 = 未知约定） ---
         if use_traj:
@@ -503,9 +557,15 @@ class BeliefState:
             if self.prev_boundary_cell is not None:
                 T[CH_POSE_PREV_BOUNDARY, self.prev_boundary_cell[0], self.prev_boundary_cell[1]] = 1
             return T
-        if self.use_dist:
-            # 裁剪轨迹：14 基础 + 距离通道（距离恒居末位，与 chan_scale[-1] 对齐）
-            return np.concatenate([T[:BASE_CHANNELS], T[CH_DIST:CH_DIST + 1]], axis=0)
+        if self.use_dist or self.use_dir:
+            # 裁剪轨迹：14 基础 + 连续尾部通道（dist 在前、align 恒居末位，
+            # 与 network.chan_scale 的尾部定位对齐）
+            tail = []
+            if self.use_dist:
+                tail.append(T[ch_dist:ch_dist + 1])
+            if self.use_dir:
+                tail.append(T[ch_align:ch_align + 1])
+            return np.concatenate([T[:BASE_CHANNELS]] + tail, axis=0)
         return T[:BASE_CHANNELS].copy()
 
     # ---------- 辅助任务 GT 通道（训练监督专用，非决策输入） ----------

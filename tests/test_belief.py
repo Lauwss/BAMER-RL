@@ -8,9 +8,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 
 from algo.belief import (
-    CH_CARRY_QUYUAN, CH_DIST, CH_POSE_N, CH_POSE_PREV_BOUNDARY, CH_POI_CHUGUO, CH_POI_QUYUAN,
-    CH_TRAIL_PREV_OPTION, CH_WALL_E, CH_WALL_N, CH_WALL_S, CH_WALL_W, BeliefState,
-    DIST_CAP, GTAssetClassifier, HEADINGS, SensingLedger, W_FREE, W_UNKNOWN, W_WALL,
+    CH_ALIGN, CH_CARRY_QUYUAN, CH_DIST, CH_POSE_N, CH_POSE_PREV_BOUNDARY, CH_POI_CHUGUO,
+    CH_POI_QUYUAN, CH_TRAIL_PREV_OPTION, CH_WALL_E, CH_WALL_N, CH_WALL_S, CH_WALL_W,
+    BeliefState, DIST_CAP, GTAssetClassifier, HEADINGS, SensingLedger, W_FREE, W_UNKNOWN, W_WALL,
 )
 from bamer_env import BamerEnv, Maze
 from bamer_mouse.lidar import LidarSpec
@@ -246,6 +246,64 @@ def test_tensor_dist_channel():
     print("[距离通道张量] OK：前缀逐位一致 / 末通道=距离场 / 15ch 组合")
 
 
+def test_alignment_field_handcheck():
+    """对齐度场手算对拍（2026-11-22 方向连续性特征）：正前/回头/垂直/对角 + 未定义情形。
+
+    参考向量 v = cell − prev_boundary_cell（上个 option 净位移）。编码
+    round((cos+1)·127)+1：+1→255、0→128、−1→1；0 = 未定义（全零=未知约定）。
+    """
+    b = BeliefState(n=10, use_dir=True)
+    b.cell = (2, 5)
+    b.prev_boundary_cell = (2, 2)              # v = (0, +3)，朝北
+    f = b.alignment_field()
+    assert f[2, 9] == 255                      # 正前 cos=+1（沿轴任意距离同值）
+    assert f[2, 0] == 1                        # 完全回头 cos=−1
+    assert f[6, 5] == 128                      # 垂直 cos=0（正东）
+    assert f[5, 9] == 230                      # 3-4-5 对角 cos=12/15=0.8 → round(228.6)+1
+    assert f[2, 5] == 0                        # 当前格自身：无方向语义 → 未定义
+    print("[对齐场手算] OK：255/1/128/对角 230/当前格 0")
+
+
+def test_alignment_field_undefined():
+    """未定义情形 → 全零通道（episode 首边界 / 零位移 option）。"""
+    b = BeliefState(n=6, use_dir=True)
+    assert not b.alignment_field().any()       # 首边界：prev_boundary_cell=None
+    b.cell = (3, 3)
+    b.prev_boundary_cell = (3, 3)              # 零位移（到位型 Pick 等）
+    assert not b.alignment_field().any()
+    print("[对齐场未定义] OK：首边界/零位移 全零 = 未知约定")
+
+
+def test_tensor_dir_channel():
+    """通道布局组合：仅 dir 17ch / dist+dir 18ch / use_traj=False 15ch；旧前缀逐位不变。"""
+    b = BeliefState(n=5, use_dir=True)
+    b.cell = (2, 2)
+    b.prev_boundary_cell = (2, 0)              # v = (0, +2) 朝北
+    b0 = BeliefState(n=5)                      # 同位姿对照（含 prev 字段，保证前缀可比）
+    b0.cell = (2, 2)
+    b0.prev_boundary_cell = (2, 0)
+    T17, T16 = b.tensor(), b0.tensor()
+    assert T17.shape == (17, 5, 5) and T16.shape == (16, 5, 5)
+    assert np.array_equal(T17[:16], T16)       # 前缀逐位一致（默认路径不受影响）
+    assert T17[-1, 2, 3] == 255 and T17[-1, 2, 2] == 0    # 末通道 = 对齐场
+    b18 = BeliefState(n=5, use_dist=True, use_dir=True)
+    b18.cell = (2, 2)
+    b18.prev_boundary_cell = (2, 0)
+    T18 = b18.tensor()
+    assert T18.shape == (18, 5, 5)
+    b0d = BeliefState(n=5, use_dist=True)
+    b0d.cell = (2, 2)
+    b0d.prev_boundary_cell = (2, 0)
+    assert np.array_equal(T18[:17], b0d.tensor())   # dist@16 与是否带 dir 无关（布局稳定）
+    assert T18[CH_DIST, 2, 2] == 0 and T18[CH_DIST, 4, 4] == DIST_CAP
+    assert T18[CH_ALIGN, 2, 3] == 255          # align@17 恒居末位
+    T15 = b.tensor(use_traj=False)
+    assert T15.shape == (15, 5, 5)             # 14 基础 + 对齐场（无轨迹）
+    assert np.array_equal(T15[:14], T16[:14])
+    assert np.array_equal(T15[14], T17[-1])
+    print("[对齐通道张量] OK：17/18/15ch 组合 + 前缀逐位一致 + dist 布局稳定")
+
+
 if __name__ == "__main__":
     test_ledger_handcheck_reset_scan()
     test_ledger_monotone_wall_sticky()
@@ -255,4 +313,7 @@ if __name__ == "__main__":
     test_gt_asset_classifier()
     test_distance_field_handcheck()
     test_tensor_dist_channel()
+    test_alignment_field_handcheck()
+    test_alignment_field_undefined()
+    test_tensor_dir_channel()
     print("\n信念层单测全部通过 [PASS]")

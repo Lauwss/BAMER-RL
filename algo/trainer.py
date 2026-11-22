@@ -90,6 +90,12 @@ class TrainConfig:
     # 探针实证旧栈距离仅靠局部观测密度代理（ρ(距离,优势)=−0.304，饱和失真）。
     # 网络侧逐通道归一（距离 /64，persistent=False buffer，旧 checkpoint 兼容）。
     dist_channel: bool = False
+    # dir_channel：方向对齐度通道（2026-11-22 方向连续性特征）：末通道 = cos 对齐
+    # 度场（belief.alignment_field，上个 option 净位移方向 × 逐格方向的 cos，边界
+    # 历史纯派生）——"候选是否在来路方向"这一成对量在候选格自身位置 RF-1 可读。
+    # 动机：repeat 主成分 = 前沿往返 = 距离打平候选间的排序失明（回头成本不对称
+    # 不可见）；场形式与 dist_channel 同款 trick（预计算绕开 RF 限制）。
+    dir_channel: bool = False
     # dilated_backbone：主干 dilation 1→2→4（padding=dilation，空间 16×16 不变，
     # 参数量不变，CUDA Graph 静态形状不变）→ 感受野 7→15——收益侧区域结构
     # （前沿后方黑域规模）可见。探针实证旧栈 ρ(局部信息量,优势)=+0.04 ≈ 零信号。
@@ -128,6 +134,11 @@ class TrainConfig:
     # 见 docs/ac_collapse_analysis.md。转正需用户确认（契约 D8 语义扩展）。
     shape_potential: bool = False
     shape_scale: float = 2000.0       # Φ∈[0,1] 全程拉势总量上限；2000 ≈ 2× 臂 B 每 bit 量级
+    # --- 送达奖励尺度（2026-11-22 消融，用户拍板 600/1000 双臂）：D8 里程碑
+    # "首次送达 +300/台" 的参数化。300 = 归档契约行为逐位不变；600/1000 检验
+    # "派送激励"假设——预注册判据 = deliver-fail↓ 且 总步数/超时不升（警惕
+    # 提前派送绕路打断扫掠连续性的反噬，见 ceiling 诊断链）。
+    reward_delivery: float = 300.0
     # --- CUDA Graph（纯性能开关，默认关）：act/学习体内核固化，轨迹与 eager
     # 逐位一致（warmup 无优化器副作用、clip/Adam.step 留在图外）；构建失败
     # 自动回退 eager。CPU 设备无效。
@@ -211,7 +222,8 @@ class Trainer:
         # 种子管理（§6.1）：master seed → 环境/agent 两条独立流
         self._env_seed_rng = np.random.default_rng(int(cfg.seed) + 100)
         self.agent = SMDPDQNAgent(
-            in_channels=14 + 2 * int(cfg.use_traj) + int(cfg.dist_channel),
+            in_channels=14 + 2 * int(cfg.use_traj) + int(cfg.dist_channel)
+                       + int(cfg.dir_channel),
             gamma=cfg.gamma, lr=cfg.lr,
             batch_size=cfg.batch_size, target_sync_options=cfg.target_sync_options,
             warmup_options=cfg.warmup_options, lambda_aux=cfg.lambda_aux,
@@ -219,9 +231,11 @@ class Trainer:
             eps_anneal_options=cfg.eps_anneal_options, capacity=cfg.capacity,
             n=self.n, aux_head=cfg.aux_head, use_gru=cfg.use_gru,
             dist_channel=cfg.dist_channel, dilated=cfg.dilated_backbone,
+            dir_channel=cfg.dir_channel,
             device=cfg.device, seed=int(cfg.seed), use_cuda_graph=cfg.cuda_graph)
         self.belief = BeliefState(n=self.n, max_range=cfg.lidar_max_range,
-                                  scan_memo=cfg.scan_memo, use_dist=cfg.dist_channel)
+                                  scan_memo=cfg.scan_memo, use_dist=cfg.dist_channel,
+                                  use_dir=cfg.dir_channel)
         self.executor = Executor(self.belief, max_option_steps=cfg.env_max_steps,
                                  lazy_replan=cfg.lazy_replan)
         self.env: Optional[BamerEnv] = None
@@ -267,9 +281,8 @@ class Trainer:
         )
 
     # ---------- 奖励（D8；事件来源 info["events"] 经 executor 聚合） ----------
-    @staticmethod
-    def _milestones(events: List[object]) -> Tuple[float, Dict[str, int]]:
-        """事件里程碑累计（+100 首次识别/终点发现，+300 首次送达）。"""
+    def _milestones(self, events: List[object]) -> Tuple[float, Dict[str, int]]:
+        """事件里程碑累计（+100 首次识别/终点发现，+cfg.reward_delivery 首次送达）。"""
         bonus = 0.0
         counts = {"identify": 0, "destination": 0, "deliver": 0}
         for ev in events:
@@ -281,7 +294,7 @@ class Trainer:
                 bonus += REWARD_FIRST_DESTINATION
                 counts["destination"] += 1
             elif getattr(ev, "type", None) == "Arrived":
-                bonus += REWARD_FIRST_DELIVER
+                bonus += float(self.cfg.reward_delivery)
                 counts["deliver"] += 1
         return bonus, counts
 
@@ -290,9 +303,9 @@ class Trainer:
         return -float(result.steps) + bonus
 
     def _reward_search(self, result, unknown_before: int, unknown_after: int) -> float:
-        """臂 A 阶段 0：全任务前半段（去掉送达 +300）。"""
+        """臂 A 阶段 0：全任务前半段（去掉送达里程碑）。"""
         bonus, _ = self._milestones(result.events)
-        bonus -= REWARD_FIRST_DELIVER * _count_arrived(result.events)
+        bonus -= float(self.cfg.reward_delivery) * _count_arrived(result.events)
         return -float(result.steps) + bonus
 
     def _reward_entropy(self, result, unknown_before: int, unknown_after: int) -> float:
