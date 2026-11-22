@@ -2,6 +2,59 @@
 
 > 契约（M2.6）冻结后的任何语义变更须先经用户确认，再记入本文件并同步单测。
 
+## 2026-11-22 — 2/3 上限定性：失败≈纯"识别盲区"（信息死格不踩）——fallback_unvisited 门控评估侧修复 68→91/69→92/73→90，@1000 无害（默认关逐位不变）
+
+
+动机：预算实验后"1500 未破 ~2/3 上限"待解释。`tools/failure_anatomy.py`（逐 seed
+贪心评估 + 失败桶分类 + 场景/轨迹特征 + 失败样例渲染）+ `tools/failure_aggregate.py`
+（跨 run 汇总）：4 run × 100 seeds @1500。**失败桶定论：budget_open=0、deadlock=0，
+失败≈纯 blindspot**——random 栈 68%（30）、dir 主臂 69%（31）、fixgen 73%（27），
+fixgen 与 random 上限同源、与拓扑/预算无关。
+
+机制 = 任务契约（ImageFeed/DestinationFeed 仅进格触发）× 激励盲区（零信息格不在
+frontier 掩码、进格无 shaping 梯度、Pick 需先识别 → 鸡生蛋）：盲区样例墙知识 100%、
+frontier=0、探索率 ~83%（未进入可达格 ~45 格，成功样例同样 ~46 格—— toured set
+之外即盲区），末段 ~560 步零进展极限环绕。GT 死胡同仅占失败 POI 13%（一般机制是
+"被扫描未踩格"）；机器占失败 POI 81%（终点固定居中几乎必被扫过）；卡死时 78% 已
+送达 1 台。3 个"硬核"seed 中 2 个可被修复 → 无结构性不可能场景。
+
+### 改动（`algo/actions.py`，门控默认关 = 逐位不变；全量 121/121 过）
+
+`legal_mask(fallback_unvisited=False)`：frontier 空的回退集由"全可达格"收窄为
+"未到访可达格"（仍空才回退全可达）——信息闭合后剩余唯一任务信号就是踩格（识别须
+进格），掩码单调收缩消灭极限环。
+
+### 2×2 因子全表（{1000,1500}×{旧掩码,fallback}，同 checkpoint 同 seeds）
+
+| run | @1000 基线 | @1000+funv | @1500 基线 | @1500+funv |
+|---|---|---|---|---|
+| random 栈 | 58 | 65 | 68 | **91** |
+| random dir | 62 | 67 | 69 | **92** |
+| fixgen | 70 | 69 | 73 | **90** |
+
+**fallback×预算强交互**：@1000 时 frontier ~900 步才闭合、剩余预算不够扫掠+派送
+（fallback 近零收益，blindspot 29→20 但 timeout 13→15）；@1500 收益全额兑现。
+旧掩码下加预算只解 timeout（blindspot 计数不动）；两因子齐才 90%+（剩余 ~9% =
+扫掠未完成的真预算问题，探索率 92%、末段游走 12-14 步）。@1000+funv 无害 → 评估/
+训练期开启在原口径下安全。协议自校验：@1000 基线 58/62 与预算实验历史逐位吻合。
+
+### repeat 相分解（30 seeds，基线贪心）
+
+frontier 期 repeat/move 0.619（占移动 82%）、回退期 0.994（占移动 18% / repeat
+质量 26%）——旧"behind 占 70% repeat 质量"约 1/4 实为盲区环绕。repeat=效率语言、
+blindspot=失败语言：@1500 上限由后者决定（repeat 干预 null 的机制解释）。
+
+### 注记
+
+- armA_g0999_aux05_fixppt 为塌缩 checkpoint（0%、训练奖励 −662），不代表官方图
+  上限（76.7% 属旧 armA_fixppt_frontier_s0，本地 runs/ 已不在）。
+- 训练期开启 fallback_unvisited（让 ε 采到 ImageFeed→Pickup 转移）为候选训练侧
+  修复，待消融；工具注意：BAMER 环境无 pytest，`output/_tmp/run_pytest_shim.py`
+  直跑 tests（GBK 控制台须 `-X utf8`）。
+- 评估产物（逐 seed CSV / 失败渲染 PNG）在 `output/failure_anatomy/`（不入库）。
+
+
+
 ## 2026-11-22 — 预算上限实验：1500 步下三臂收敛（64/68/69%）——臂间分离的主体是"紧预算 × 效率差"互作伪影
 
 动机：ceiling 效率账本"近全覆盖需 ~1630 步 > 1000 步预算，搜索超时是效率的

@@ -98,7 +98,8 @@ def frontier_cells(belief: BeliefState) -> Set[Cell]:
     return fron
 
 
-def legal_mask(belief: BeliefState, frontier_only: bool = False) -> np.ndarray:
+def legal_mask(belief: BeliefState, frontier_only: bool = False,
+               fallback_unvisited: bool = False) -> np.ndarray:
     """当前信念下的合法选项掩码 (259,) bool。
 
     调用时机 = 决策边界（belief 已消费到当前步的 obs/info）。
@@ -106,6 +107,11 @@ def legal_mask(belief: BeliefState, frontier_only: bool = False) -> np.ndarray:
     信念前沿格——零信息目标被排除出候选集，消除贪心微步环；Explore 执行必然
     揭示 ≥1 未知墙槽，与势能 shaping 的增量语义一致。frontier 为空（可达区域
     完全观测）时回退全可达集。
+    fallback_unvisited=True（2026-11-22 盲区修复，评估侧验证）：frontier 空的回退
+    集再收窄为"未到访可达格"——信息已闭合但 POI 未识别时，剩余唯一任务信号就是
+    踩格（识别须进格、进零信息格在 frontier/shaping 语义下无梯度），全可达回退
+    会令贪心在已到访格间极限环绕（failure_anatomy 实测末段 ~560 步零进展）。
+    未到访集为空（全覆盖）时回退全可达集，保证合法集非空。
     合法集保证非空：机器鼠来路边界必然已探明无墙（每个到访格的入射开放
     边界由扫描揭示），Explore 回溯目标恒存在。
     """
@@ -118,6 +124,10 @@ def legal_mask(belief: BeliefState, frontier_only: bool = False) -> np.ndarray:
         fron.discard(belief.cell)
         if fron:                                    # 空 = 可达区域完全观测 → 回退
             reach = fron
+        elif fallback_unvisited:
+            unvisited = {c for c in reach if c not in belief.visited}
+            if unvisited:                           # 仍有未踩格 → 踩格回退
+                reach = unvisited
     for cell in reach:
         mask[explore_index(cell, n)] = True
     if belief.carrying is None:

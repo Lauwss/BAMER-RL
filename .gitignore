@@ -8,3 +8,6 @@ algo/runs/
 
 # swanlab 本地缓存（云端模式下为上报记录副本）
 swanlog/
+
+# 评估/调试产物（逐 seed CSV、失败渲染 PNG、临时脚本；数字摘要入 CHANGELOG/docs）
+output/
