@@ -108,6 +108,19 @@ seed 随机布点、终点固定 (7,7)/(8,8)——与 fixgen 评估完全同口�
 （固定图固定终点），相关数字是本列（56-67%），且应在官方图实例上补评
 （maze_fixed="official" 套件，eval.py 设计已预留分套报告）。
 
+## 2026-11-22 — learn_every 超参（批学习间隔消融）+ 后续消融 batch 入档
+
+- `TrainConfig.learn_every: int = 1`（`algo/trainer.py`）：每 N 个 option 学习
+  一步，缓冲照常累积；按全局 `options_seen` 取模跳过（checkpoint 恢复后节奏
+  不变），默认 1 时行为逐位不变。背景：批学习占墙钟 32.0%（上节剖析），
+  learn_every=2 实测学习步 79,010/160,081 options ≈ 减半、墙钟无显著变化
+  （GPU 非瓶颈），held-out 75% vs 基线 50%（详见
+  [docs/ablation_followup_20261122.md](ablation_followup_20261122.md)）；
+- 新增消融配置 6 个：`armA_frontier_{rf_long,lidar90,lidar60,learn2}.yaml`、
+  `armA_fixppt_frontier_{s0,s1}.yaml`（2026-11-22 batch，判据见文件头注释）；
+- 实测发现（非语义变更）：lidar 60/90/180 束在槽位级二值 belief + 量程 2.0
+  下训练流逐位等效——束数不承载 belief 信息，降束纯剩墙钟问题。
+
 ## 2026-11-21 — 每步管线性能等价优化（lazy_replan + scan_memo，吞吐 +47%）
 
 背景：frontier 引导后 option 平均长度 τ 3.5-5.0 → 12-18 步（定向远征），每步

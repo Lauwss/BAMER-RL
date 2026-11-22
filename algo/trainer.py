@@ -103,6 +103,8 @@ class TrainConfig:
     batch_size: int = 64
     target_sync_options: int = 1000
     warmup_options: int = 2000
+    learn_every: int = 1              # 批学习间隔：每 N 个 option 学一步（>1 省学习墙钟，
+                                      # 经验照常累积；全局计数取模，checkpoint 恢复后节奏不变）
     lambda_aux: float = 0.5           # 消融 {0, 0.1, 0.5, 1.0}
     grad_clip: float = 10.0
     eps_start: float = 0.10
@@ -147,6 +149,8 @@ class TrainConfig:
             raise ValueError("eval_every_options 须 >=0，eval_mini_seeds 须 >=1")
         if self.shape_potential and self.shape_scale <= 0:
             raise ValueError(f"shape_potential=True 时 shape_scale 须 >0，得到 {self.shape_scale!r}")
+        if self.learn_every < 1:
+            raise ValueError(f"learn_every 须 >=1，得到 {self.learn_every!r}")
         if self.maze_fixed not in (None, "official", "generated"):
             raise ValueError(f"maze_fixed 仅支持 None/'official'/'generated'，得到 {self.maze_fixed!r}")
 
@@ -454,7 +458,9 @@ class Trainer:
 
             self.agent.observe(s, action, reward, s2, result.steps,
                                result.terminated, mask, mask2, gt_south, gt_west)
-            stats = self.agent.maybe_learn()
+            # learn_every>1 时按全局 option 计数取模跳过学习步（缓冲照常写入）
+            stats = (self.agent.maybe_learn()
+                     if self.agent.options_seen % cfg.learn_every == 0 else None)
             self.agent.maybe_sync_target()
             if stats is not None:
                 stats_rows.append(stats)
