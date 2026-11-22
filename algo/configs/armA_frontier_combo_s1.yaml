@@ -1,0 +1,57 @@
+﻿# 组合臂（候选默认栈）seed 0：dist_channel + dilated_backbone + learn_every=2
+# 三改进首次同栈合测。对照与判读矩阵（5 run）：
+#   正交性（learn2 新栈复核）：本 run vs algo/runs/armA_frontier_dist_dilate
+#     （s0、learn1、58%）——同 seed 同栈仅差 learn_every，配对归因；
+#   rf 转正训练种子方差：{基线 frontier, 组合臂} × seeds 0/1/2 矩阵（基线行 =
+#     armA_g0999_aux05_frontier(s0=40%) + armA_frontier_{s1,s2}；组合行 = 本组 3 run）。
+# lidar 保持 180 束（归因纯度；lidar60 折入待组合臂验证后做——60/90/180 在槽位
+# 级二值 belief 下已证逐位等效，属纯墙钟收益）。
+arm: A
+stage0_options: 40000
+stage1_options: 120000
+stage1_eps_restart: 0.05
+stage1_lr: null
+
+env_randomize: true
+env_max_steps: 1000
+lidar_n_beams: 180
+lidar_max_range: 2.0
+swanlab: true
+swanlab_project: BAMER-RL
+swanlab_mode: cloud
+eval_every_options: 10000
+eval_mini_seeds: 3
+maze_n: 16
+maze_braiding_stage0: 0.0
+maze_loops_stage0: [0, 30]
+maze_braiding_stage1: 0.8
+maze_loops_stage1: [25, 50]
+frontier_mask: true            # 同栈：frontier 引导
+
+dist_channel: true             # 感受野修复①：末通道 = BFS 距离场
+dilated_backbone: true         # 感受野修复②：主干 dilation 1/2/4（RF 7→15）
+learn_every: 2                 # 学习间隔减半更新频率（超参变更，learn2 判据 +25pp 待新栈复核）
+
+gamma: 0.999
+lr: 1.0e-4
+batch_size: 64
+target_sync_options: 1000
+warmup_options: 2000
+lambda_aux: 0.5
+grad_clip: 10.0
+eps_start: 0.10
+eps_end: 0.02
+eps_anneal_options: 20000
+capacity: 100000
+aux_head: true
+use_traj: true
+use_gru: false
+
+shape_potential: true
+shape_scale: 2000.0
+cuda_graph: true
+
+seed: 1
+out_dir: algo/runs/armA_frontier_combo_s1
+checkpoint_every_options: 10000
+smoke: false
